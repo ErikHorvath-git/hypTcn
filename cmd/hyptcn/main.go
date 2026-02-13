@@ -2,19 +2,23 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/example/hypTcn/internal/extractor"
 	"github.com/example/hypTcn/internal/orchestrator"
 	"github.com/spf13/cobra"
 )
 
 var (
-	socketPath = "/tmp/hyptcn.sock"
-	rootCmd    = newRootCmd()
+	socketPath     = "/tmp/hyptcn.sock"
+	vmName         = "guest"
+	targetAddress  = uint64(0x1000)
+	sampleInterval = 5 * time.Second
+	rootCmd        = newRootCmd()
 )
 
 func main() {
@@ -31,6 +35,9 @@ func newRootCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&socketPath, "socket", socketPath, "path to analyzer Unix domain socket")
+	cmd.Flags().StringVar(&vmName, "vm", vmName, "libvmi guest domain name")
+	cmd.Flags().Uint64Var(&targetAddress, "address", targetAddress, "physical address to sample")
+	cmd.Flags().DurationVar(&sampleInterval, "interval", sampleInterval, "sampling interval")
 	return cmd
 }
 
@@ -39,22 +46,15 @@ func runScan(cmd *cobra.Command, _ []string) error {
 	defer cancel()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	logger.Info("starting scan", "socket", socketPath)
+	logger.Info("starting scan", "socket", socketPath, "vm", vmName, "address", targetAddress, "interval", sampleInterval)
 
-	engine := orchestrator.NewEngine(socketPath, logger)
+	engine := orchestrator.NewEngine(socketPath, vmName, logger)
 
-	dump, err := extractor.FetchPage(0x1000)
-	if err != nil {
-		logger.Error("failed to capture page", "err", err)
+	if err := engine.Stream(ctx, targetAddress, sampleInterval); err != nil && !errors.Is(err, context.Canceled) {
+		logger.Error("streaming aborted", "err", err)
 		return err
 	}
 
-	pred, err := engine.Analyze(ctx, dump)
-	if err != nil {
-		logger.Error("analysis failed", "err", err)
-		return err
-	}
-
-	logger.Info("prediction", "score", pred.AnomalyScore, "status", pred.Status)
+	logger.Info("stopping scan loop")
 	return nil
 }
