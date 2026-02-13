@@ -1,24 +1,18 @@
 import logging
 
+import torch
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+
+from analyzer_service.model import TCNModel
+from analyzer_service.processor import PageBuffer
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("analyzer")
 APP = FastAPI(title="hypTcn Analyzer")
 
-
-class TCNModel:
-    def __init__(self):
-        LOG.info("loading placeholder TCN model into memory")
-
-    def infer(self, data: bytes) -> dict:
-        score = min(1.0, len(data) / 1024.0)
-        status = "suspicious" if score > 0.5 else "clean"
-        return {"anomaly_score": round(score, 4), "status": status}
-
-
 MODEL = TCNModel()
+BUFFER = PageBuffer()
 
 
 class AnalyzeResponse(BaseModel):
@@ -37,8 +31,18 @@ async def analyze(request: Request):
     if not data:
         raise HTTPException(status_code=400, detail="empty payload")
 
-    result = MODEL.infer(data)
-    return result
+    sequence = BUFFER.append(data)
+    if sequence is None:
+        raise HTTPException(status_code=202, detail="waiting for buffer")
+
+    tensor = torch.from_numpy(sequence).unsqueeze(0)
+    tensor = tensor.to(torch.float32)
+
+    score = MODEL.infer(tensor)
+    status = "suspicious" if score > 0.5 else "clean"
+    LOG.info("anomaly score: %.4f", score)
+
+    return AnalyzeResponse(anomaly_score=score, status=status)
 
 
 @APP.get("/health")
