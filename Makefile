@@ -13,7 +13,7 @@ all: bin/hyptcn
 
 bin/hyptcn:
 	@mkdir -p bin
-	GOCACHE=$(GOCACHE) $(GO) build -o $@ ./cmd/hyptcn
+	CGO_LDFLAGS="-lvmi" GOCACHE=$(GOCACHE) $(GO) build -o $@ ./cmd/hyptcn
 
 deps: $(VENV)/bin/activate
 

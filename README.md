@@ -1,38 +1,68 @@
 # hypTcn
+![hypTcn status](https://img.shields.io/badge/status-beta-blue)
 
-Modular proof-of-concept for a hypervisor-aware security tool that stitches together C, Go, and Python components in a production-ready layout suitable for a thesis repository.
+hypTcn is a modular, hypervisor-aware security toolkit that performs live memory introspection on KVM guests and feeds the resulting temporal sequences into a Temporal Convolutional Network (TCN) for anomaly detection. The project stitches together a libvmi-powered C extractor, a Go orchestrator that streams snapshots over Unix domain sockets (UDS), and a PyTorch-based analyzer that learns temporal patterns across 4 KiB pages.
 
 ## Architecture
 
-- **C extractor** (`internal/extractor/probe.{c,h}`) exposes `int fetch_ram_page(uint64_t address, char* buffer)` that simulates a low-level hypervisor page fetch. It is compiled into an object file and linked via CGO.
-- **Go orchestrator** (`internal/orchestrator/engine.go`) maintains structured logging with `slog`, handles HTTP-over-Unix-domain-socket communication, and exposes a reusable `Engine` that forwards raw binary snapshots to the analyzer service with minimal copying.
-- **Go CLI** (`cmd/hyptcn/main.go`) uses `cobra` to implement the `scan` command, captures signal-driven graceful shutdown, and drives the orchestrator while reporting predictions.
-- **Python analyzer service** (`analyzer_service/server.py`) boots a FastAPI app, preloads a placeholder `TCNModel`, and exposes `/analyze` for binary inference requests, serving over a Unix domain socket.
+- **Data Source – `internal/extractor/`**  
+  Native C probe powered by libvmi (`VMI_KVM`, `VMI_INIT_NAME`) that reads exactly one 4 KiB physical page per sampling interval.
+- **Orchestration – `cmd/hyptcn/` & `internal/orchestrator/`**  
+  Cobra-driven CLI (`hyptcn scan`) captures OS signals, runs a sampling loop, and forwards each page via HTTP-over-UDS to the analyzer. The Go `Engine` repeatedly calls `extractor.ExtractPage`, attaches metadata, and routes the data through a resilient UDS client.
+- **Analysis – `analyzer_service/`**  
+  FastAPI service hosting a PyTorch TCN (`model/` package). Incoming 4 KiB pages are histogrammed and buffered, then fed to dilated residual blocks that respect causality; the temporal nature of the TCN lets it detect drift across time instead of isolated snapshots.
 
-## Prerequisites (Fedora)
+## Prerequisites
 
+### Fedora (Development)
 ```sh
-sudo dnf install make gcc go python3
+sudo dnf install make gcc go python3 libvmi-devel
 ```
 
-## Workflow
+### Debian (Production)
+```sh
+sudo apt install build-essential golang python3-venv libvmi-dev
+```
 
-1. `make deps` — installs a virtual environment (`.venv/`) and the Python requirements (`fastapi`, `uvicorn`).
-2. `make` — builds `bin/hyptcn` with CGO (the extractor is compiled along with the Go code) using a repository-local `GOCACHE`.
-3. `make python-service` (in a separate terminal) — starts the FastAPI server listening on `/tmp/hyptcn.sock`.
-4. `./bin/hyptcn --socket /tmp/hyptcn.sock` — runs the Cobra-driven orchestrator, captures a hypervisor page, forwards it to the analyzer, and logs the prediction. The command handles `SIGINT`/`SIGTERM` gracefully.
+- Ensure `/etc/libvmi/libvmi.conf` points to your KVM socket or domain discovery mechanism.
+- Add your user to the `kvm` group so libvmi can talk to the hypervisor:
+```sh
+sudo usermod -aG kvm $USER
+```
 
-## Project layout
+## Build Instructions
+
+1. `make deps`  
+   Sets up `.venv/` and installs `fastapi`, `uvicorn`, `torch`, `numpy`, and other Python dependencies.
+
+2. `make`  
+   Builds `bin/hyptcn`, compiling the CGO bridge and linking `-lvmi` to ship a standalone Go binary.
+
+## How-to-Run
+
+1. Start the analyzer (FastAPI + UDS listener):
+   ```sh
+   make python-service
+   ```
+
+2. Launch the scanner and point it at a specific VM/physical address:
+   ```sh
+   ./bin/hyptcn scan --vm <vm_name> --address 0x12345678 --socket /tmp/hyptcn.sock
+   ```
+   The CLI accepts `--interval` to adjust sampling cadence; it streams pages continuously and logs anomaly scores returned by the temporal model.
+
+## Component Breakdown
 
 ```
-cmd/hyptcn/             # Cobra CLI entry point
-internal/extractor/      # CGO bridge plus C probe implementation
-internal/orchestrator/   # Engine that dials the analyzer service via UDS
-analyzer_service/        # FastAPI + uvicorn analyzer server
-third_party/             # Local cobra shim for offline builds
-Makefile                # Builds Go binary, compiles C, and boots Python env/service
-README.md               # This document
-.go.mod/.sum            # Go module definition
-.venv/                  # Created by make deps
-bin/                    # Output binary
+analyzer_service/       # Python TCN logic (FastAPI, PyTorch, model/ package)
+bin/                    # Compiled Go binaries (hyptcn CLI)
+cmd/hyptcn/             # Cobra entry point that configures CLI flags and starts the Engine
+internal/extractor/     # CGO bridge + LibVMI probe (probe.c/h + extractor.go)
+internal/orchestrator/  # Go Engine (UDS streaming, HTTP transport, sampling loop)
+Makefile                # Builds Go binary with CGO, manages Python venv/service
+third_party/            # Vendored dependencies (e.g., Cobra shim)
 ```
+
+## Temporal Innovation
+
+hypTcn’s core innovation is the temporal analysis loop: while libvmi produces raw 4 KiB snapshots, the PyTorch TCN in `analyzer_service/model/` tracks how those histograms change over time using dilated causal convolutions. This lets the network understand sequences, detect gradual drifts, and differentiate between transient noise and evolving attacks.
