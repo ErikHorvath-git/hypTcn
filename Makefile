@@ -5,15 +5,15 @@ CC=gcc
 PYTHON=python3
 VENV=.venv
 PIP=$(VENV)/bin/pip
-UVICORN=$(VENV)/bin/uvicorn
 GOCACHE=$(CURDIR)/.cache/go-build
+GOPATH=$(CURDIR)/.cache/go-path
 REQUIREMENTS=analyzer_service/requirements.txt
 
 all: bin/hyptcn
 
 bin/hyptcn:
 	@mkdir -p bin
-	CGO_LDFLAGS="-lvmi" GOCACHE=$(GOCACHE) $(GO) build -o $@ ./cmd/hyptcn
+	CGO_LDFLAGS="-lvmi" GOCACHE=$(GOCACHE) GOPATH=$(GOPATH) $(GO) build -o $@ ./cmd/hyptcn
 
 deps: $(VENV)/bin/activate
 
@@ -23,7 +23,7 @@ $(VENV)/bin/activate: $(REQUIREMENTS)
 	$(PIP) install -r $(REQUIREMENTS)
 
 python-service: deps
-	$(UVICORN) analyzer_service.server:APP --uds /tmp/hyptcn.sock --log-level info
+	$(VENV)/bin/python -m analyzer_service.server --socket /tmp/hyptcn.sock
 
 clean:
 	rm -rf bin
