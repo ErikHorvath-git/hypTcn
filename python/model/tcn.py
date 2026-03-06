@@ -37,8 +37,10 @@ NUM_BLOCKS = 3
 FILTERS = 32
 DROPOUT = 0.1
 
+# Resolve to <repo>/models/tcn_weights.pt regardless of CWD
 WEIGHTS_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "models", "tcn_weights.pt"
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "models", "tcn_weights.pt",
 )
 
 

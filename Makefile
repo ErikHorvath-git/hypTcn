@@ -7,7 +7,7 @@ VENV=.venv
 PIP=$(VENV)/bin/pip
 GOCACHE=$(CURDIR)/.cache/go-build
 GOPATH=$(CURDIR)/.cache/go-path
-REQUIREMENTS=analyzer_service/requirements.txt
+REQUIREMENTS=python/requirements.txt
 
 all: bin/hyptcn
 
@@ -23,7 +23,7 @@ $(VENV)/bin/activate: $(REQUIREMENTS)
 	$(PIP) install -r $(REQUIREMENTS)
 
 python-service: deps
-	$(VENV)/bin/python -m analyzer_service.server --socket /tmp/hyptcn.sock
+	$(VENV)/bin/python python/analyzer.py --socket /tmp/hyptcn.sock
 
 clean:
 	rm -rf bin

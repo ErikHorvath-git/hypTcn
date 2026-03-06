@@ -50,7 +50,7 @@ hypTCn is a hypervisor-aware security toolkit for live memory introspection on K
                              │ └────────────────────────────────────┘
                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Python Analyzer  analyzer.py                                       │
+│  Python Analyzer  python/analyzer.py                                │
 │  asyncio UDS server on /tmp/hyptcn.sock                             │
 │  _iter_frames(): readexactly(8) + readexactly(4096) per frame       │
 │  Sliding window: deque(maxlen=16) of feature vectors                │
@@ -60,7 +60,7 @@ hypTCn is a hypervisor-aware security toolkit for live memory introspection on K
                              │ calls
                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Feature Extractor  feature_extractor.py                            │
+│  Feature Extractor  python/model/features.py                        │
 │  extract(page, address, prev_features) → np.ndarray shape (18,)     │
 │  18 semantic features, all normalized to [0.0, 1.0]                │
 └────────────────────────────┬────────────────────────────────────────┘
@@ -68,7 +68,7 @@ hypTCn is a hypervisor-aware security toolkit for live memory introspection on K
                              │ when window full: np.stack → (18, 16)
                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  TCN Model  tcn_model.py                                            │
+│  TCN Model  python/model/tcn.py                                     │
 │  Input: (1, 18, 16)  — batch × features × sequence                 │
 │  3 × TCNBlock (dilations 1, 2, 4) → GlobalAvgPool → Dense → Sigmoid│
 │  infer() → float score in [0.0, 1.0]                               │
@@ -138,41 +138,41 @@ C wrapper around LibVMI. `fetch_guest_page(vm_name, physical_address, buffer)`:
 
 ---
 
-### `analyzer.py`
+### `python/analyzer.py`
 
-The active analyzer service. An asyncio UDS server that accepts one persistent connection from the Go binary per run. `_iter_frames()` reads frames with `readexactly(8)` + `readexactly(4096)`, unpacking the address with `struct.unpack("<Q", header)`. Per frame, it calls `feature_extractor.extract()`, appends the result to a `deque(maxlen=16)`, and either emits a warming-up response or stacks the deque into a `(16, 16)` array and runs `tcn_model.infer()`. Both the socket response and stdout receive the same JSON. The model is loaded once at startup via `tcn_model.load_model()`.
+The active analyzer service. An asyncio UDS server that accepts one persistent connection from the Go binary per run. `_iter_frames()` reads frames with `readexactly(8)` + `readexactly(4096)`, unpacking the address with `struct.unpack("<Q", header)`. Per frame, it calls `feature_extractor.extract()`, appends the result to a `deque(maxlen=16)`, and either emits a warming-up response or stacks the deque into a `(18, 16)` array and runs `tcn_model.infer()`. Both the socket response and stdout receive the same JSON. The model is loaded once at startup via `tcn_model.load_model()`.
 
 **Key items:** `_iter_frames()`, `_handle()`, `_serve()`, `ALERT_THRESHOLD = 0.85`, `FRAME_SIZE = 4104`, `SEQUENCE_LENGTH = 16`.
 
-**Connects to:** `feature_extractor.py` and `tcn_model.py`; responds to `engine.go` over UDS.
+**Connects to:** `python/model/features.py` and `python/model/tcn.py`; responds to `engine.go` over UDS.
 
 ---
 
-### `feature_extractor.py`
+### `python/model/features.py`
 
-Pure Python/NumPy feature extraction. `extract(page, address)` converts a 4096-byte page into a shape-`(16,)` float32 array. All values are normalized to `[0.0, 1.0]`. Helper functions are private (`_`-prefixed) and operate on NumPy arrays for performance. `_run_boundaries()` is the shared primitive underlying all run-length based features, using sentinel padding and `np.diff` to find run starts and ends without Python loops over bytes.
+Pure Python/NumPy feature extraction. `extract(page, address, prev_features)` converts a 4096-byte page into a shape-`(18,)` float32 array. All values are normalized to `[0.0, 1.0]`. Helper functions are private (`_`-prefixed) and operate on NumPy arrays for performance. `_run_boundaries()` is the shared primitive underlying all run-length based features, using sentinel padding and `np.diff` to find run starts and ends without Python loops over bytes.
 
-**Key items:** `extract()`, `FEATURE_DIM = 16`, `_run_boundaries()`, `_bytes_in_runs()`, `_block_entropy()`, `_pe_header_score()`, `_elf_header_score()`, `_syscall_pattern_count()`, `_count_strings()`.
+**Key items:** `extract()`, `FEATURE_DIM = 18`, `_run_boundaries()`, `_bytes_in_runs()`, `_block_entropy()`, `_pe_header_score()`, `_elf_header_score()`, `_syscall_pattern_count()`, `_count_strings()`.
 
-**Connects to:** called by `analyzer.py`; produces input for `tcn_model.infer()`.
-
----
-
-### `tcn_model.py`
-
-Standalone PyTorch model. `TCNAnomalyDetector` stacks three `_TCNBlock` instances, applies global average pooling, then two linear layers with sigmoid output. `load_model()` returns an eval-mode instance, loading weights from `models/tcn_weights.pt` if the file exists. `infer(model, window)` accepts a `(16, 16)` NumPy array (or transposed), unsqueezes to `(1, 16, 16)`, runs the forward pass under `torch.no_grad()`, and returns a Python float.
-
-**Key items:** `TCNAnomalyDetector`, `_TCNBlock`, `_CausalConv1d`, `load_model()`, `infer()`, `WEIGHTS_PATH`, `FEATURE_DIM = 16`, `SEQUENCE_LENGTH = 16`, `FILTERS = 32`.
-
-**Connects to:** called by `analyzer.py`; weights loaded from `models/tcn_weights.pt`.
+**Connects to:** called by `python/analyzer.py`; produces input for `tcn_model.infer()`.
 
 ---
 
-### `analyzer_service/` (legacy prototype)
+### `python/model/tcn.py`
 
-An earlier iteration of the analyzer, retained for reference. Uses 256-bin byte-frequency histograms as features (instead of 16 semantic features), a 4-block TCN with 256 hidden channels, and returns `{"anomaly_score": float, "status": "clean"|"suspicious"|"warming_up"}`. The active pipeline is `analyzer.py` + `feature_extractor.py` + `tcn_model.py`. The `analyzer_service` package is not used in the current run path.
+Standalone PyTorch model. `TCNAnomalyDetector` stacks three `_TCNBlock` instances, applies global average pooling, then two linear layers with sigmoid output. `load_model()` returns an eval-mode instance, loading weights from `models/tcn_weights.pt` if the file exists. `infer(model, window)` accepts a `(18, 16)` NumPy array (or transposed), unsqueezes to `(1, 18, 16)`, runs the forward pass under `torch.no_grad()`, and returns a Python float.
 
-**Files:** `server.py`, `processor.py`, `model/architecture.py`, `model/layers.py`, `model/constants.py`, `model/__init__.py`.
+**Key items:** `TCNAnomalyDetector`, `_TCNBlock`, `_CausalConv1d`, `load_model()`, `infer()`, `WEIGHTS_PATH`, `FEATURE_DIM = 18`, `SEQUENCE_LENGTH = 16`, `FILTERS = 32`.
+
+**Connects to:** called by `python/analyzer.py`; weights loaded from `models/tcn_weights.pt`.
+
+---
+
+### `python/` (Python package root)
+
+Contains the full Python pipeline. `python/analyzer.py` is the entry point; `python/model/` holds `tcn.py` (model) and `features.py` (feature extraction). Run from the repo root as `.venv/bin/python python/analyzer.py`.
+
+**Files:** `analyzer.py`, `model/__init__.py`, `model/tcn.py`, `model/features.py`, `requirements.txt`.
 
 ---
 
@@ -184,7 +184,7 @@ Minimal vendored stub of the Cobra CLI library. Implements `Command` (with `Exec
 
 ### `Makefile`
 
-Three targets: `all` builds `bin/hyptcn` with `CGO_LDFLAGS="-lvmi"` and a local GOCACHE/GOPATH under `.cache/`; `deps` creates `.venv` and installs `analyzer_service/requirements.txt`; `python-service` runs the legacy `analyzer_service.server`. `clean` removes `bin/`, `.venv/`, `.cache/`.
+Three targets: `all` builds `bin/hyptcn` with `CGO_LDFLAGS="-lvmi"` and a local GOCACHE/GOPATH under `.cache/`; `deps` creates `.venv` and installs `python/requirements.txt`; `python-service` runs `python/analyzer.py`. `clean` removes `bin/`, `.venv/`, `.cache/`.
 
 ---
 
@@ -217,7 +217,7 @@ Each 4096-byte page and its physical address produce one float32 vector of shape
 
 ## TCN Model Architecture
 
-**File:** `tcn_model.py` — **Class:** `TCNAnomalyDetector`
+**File:** `python/model/tcn.py` — **Class:** `TCNAnomalyDetector`
 
 ```
 Input:  (batch=1, features=18, sequence=16)
@@ -295,7 +295,7 @@ make
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r python/requirements.txt
 # installs torch>=2.0, numpy>=1.26
 ```
 
@@ -305,7 +305,7 @@ Start the analyzer first, then the scanner in a second terminal:
 
 ```sh
 # Terminal 1 — analyzer
-.venv/bin/python analyzer.py
+.venv/bin/python python/analyzer.py
 
 # Terminal 2 — scanner (mock frames, 100 ms interval)
 ./bin/hyptcn --mock --interval 100
@@ -315,7 +315,7 @@ Start the analyzer first, then the scanner in a second terminal:
 
 ```sh
 # Terminal 1
-.venv/bin/python analyzer.py --socket /tmp/hyptcn.sock
+.venv/bin/python python/analyzer.py --socket /tmp/hyptcn.sock
 
 # Terminal 2
 ./bin/hyptcn --vm myguest --address 0x1000000 --interval 500
@@ -331,7 +331,7 @@ Start the analyzer first, then the scanner in a second terminal:
 ### Mock mode — full end-to-end without a VM
 
 ```sh
-.venv/bin/python analyzer.py &
+.venv/bin/python python/analyzer.py &
 ./bin/hyptcn --mock --interval 100
 ```
 
@@ -364,7 +364,7 @@ time=2026-03-06T02:01:39.814+01:00 level=INFO msg="analysis complete" score=0.49
 ### Custom socket path
 
 ```sh
-.venv/bin/python analyzer.py --socket /run/hyptcn/analyzer.sock
+.venv/bin/python python/analyzer.py --socket /run/hyptcn/analyzer.sock
 ./bin/hyptcn --mock --socket /run/hyptcn/analyzer.sock --interval 250
 ```
 
@@ -385,8 +385,8 @@ level=ERROR msg="streaming aborted" err="failed to dial analyzer socket \"/tmp/h
 The following works end-to-end today in mock mode:
 
 - **Mock frame generation.** `--mock` fills 4096-byte pages with `crypto/rand` bytes at sequential physical addresses (`0x1000`, `0x2000`, …) at the configured millisecond interval.
-- **All 16 features.** `feature_extractor.extract()` computes all 16 features correctly; every value stays in `[0.0, 1.0]` across random, zero-filled, text, ELF, and PE page types.
-- **TCN inference.** `TCNAnomalyDetector` forward pass runs correctly on `(1, 16, 16)` input; `infer()` returns a valid float.
+- **All 18 features.** `python/model/features.py` `extract()` computes all 18 features correctly; every value stays in `[0.0, 1.0]` across random, zero-filled, text, ELF, and PE page types.
+- **TCN inference.** `TCNAnomalyDetector` forward pass runs correctly on `(1, 18, 16)` input; `infer()` returns a valid float.
 - **Sliding window.** `analyzer.py` correctly emits `warming_up` for frames 1–15 and live scores from frame 16 onward.
 - **Alert threshold.** `score > 0.85` sets `"alert": true`; with random weights scores cluster near 0.496, so no false alerts fire in mock mode.
 - **UDS retry.** Go binary retries the socket connection 3× with 1s delays before exiting.
@@ -401,8 +401,8 @@ The following works end-to-end today in mock mode:
 ### Infrastructure TODO
 
 - [ ] Add `--vm` flag integration with real LibVMI (remove mock requirement for live VM scanning)
-- [ ] Add `entropy_delta` and `addr_delta` temporal features (T vs T−1 comparison across consecutive frames)
-- [ ] Persistent frame logging to `.npy` files for dataset collection (`--log-dir` flag)
+- [x] Add `entropy_delta` and `addr_delta` temporal features (T vs T−1 comparison across consecutive frames)
+- [x] Persistent frame logging to `.npy` files for dataset collection (`--log-dir` flag in `python/analyzer.py`)
 - [ ] Training script (`train.py`) with 70/15/15 split, Adam optimizer, early stopping on validation loss
 - [ ] Model evaluation script: confusion matrix, ROC-AUC, F1 score, per-frame latency benchmarks
 - [ ] REST API or gRPC endpoint for score streaming instead of stdout JSON
@@ -425,7 +425,7 @@ Honest accounting of everything not yet implemented:
 
 - **Real LibVMI connection to a live VM.** The C extractor and CGO bridge compile and link correctly, but the end-to-end path from `vmi_read_pa` through to the Python analyzer has only been tested in mock mode. A real KVM guest with a matching `libvmi.conf` entry is required to validate it.
 - **Trained model weights.** `models/tcn_weights.pt` does not exist. The model produces scores near 0.496 for all inputs because weights are random. The model will not detect anything meaningful until trained on labeled normal/malicious memory traces.
-- **Dataset collection infrastructure.** There is no `--log-dir` flag, no `.npy` frame logger, and no labeling pipeline. Both normal and malicious memory captures need to be collected and labeled before training can begin.
+- **Dataset collection infrastructure.** `python/analyzer.py --log-dir <path> --label <name>` saves frames as `.npy` files. Both normal and malicious memory captures still need to be collected and labeled before training can begin.
 - **Training and evaluation pipeline.** No `train.py`, no `eval.py`, no loss curves, no ROC-AUC measurement.
 - **Process-level features via semantic gap.** The system operates at the physical page level with no knowledge of which guest process owns a given page. Detecting hidden processes (Diamorphine-style DKOM) requires parsing guest kernel data structures — `task_struct` linked lists on Linux, EPROCESS chains on Windows — a significant VMI engineering task involving OS version-specific symbol offsets.
 - **Performance benchmarking under real hypervisor load.** No measurements exist for feature extraction latency, TCN inference time, or the overhead imposed on the guest by continuous `vmi_read_pa` calls.

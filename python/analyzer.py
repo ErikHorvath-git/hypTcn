@@ -4,7 +4,7 @@ Reads 4104-byte frames from the Go scanner:
     [8B physical address, little-endian uint64][4096B raw page data]
 
 Per frame:
-  - Extracts 18-element feature vector via feature_extractor (with prev_features)
+  - Extracts 18-element feature vector via model.features (with prev_features)
   - Optionally logs raw frame + features to --log-dir as .npy files
   - Appends to a 16-frame sliding window deque
   - When window is full: runs TCN inference, emits JSON
@@ -36,8 +36,8 @@ from collections import deque
 
 import numpy as np
 
-import feature_extractor
-import tcn_model
+from model import features as feature_extractor
+from model import tcn as tcn_model
 
 PAGE_SIZE = 4096
 HEADER_SIZE = 8
