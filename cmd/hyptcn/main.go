@@ -14,11 +14,12 @@ import (
 )
 
 var (
-	socketPath     = "/tmp/hyptcn.sock"
-	vmName         = "guest"
-	targetAddress  = uint64(0x1000)
-	sampleInterval = 5 * time.Second
-	rootCmd        = newRootCmd()
+	socketPath    = "/tmp/hyptcn.sock"
+	vmName        = "guest"
+	targetAddress = uint64(0x1000)
+	intervalMs    = 100
+	mockMode      = false
+	rootCmd       = newRootCmd()
 )
 
 func main() {
@@ -36,8 +37,9 @@ func newRootCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&socketPath, "socket", socketPath, "path to analyzer Unix domain socket")
 	cmd.Flags().StringVar(&vmName, "vm", vmName, "libvmi guest domain name")
-	cmd.Flags().Uint64Var(&targetAddress, "address", targetAddress, "physical address to sample")
-	cmd.Flags().DurationVar(&sampleInterval, "interval", sampleInterval, "sampling interval")
+	cmd.Flags().Uint64Var(&targetAddress, "address", targetAddress, "physical address to sample (non-mock)")
+	cmd.Flags().IntVar(&intervalMs, "interval", intervalMs, "sampling interval in milliseconds")
+	cmd.Flags().BoolVar(&mockMode, "mock", mockMode, "generate fake frames instead of calling libvmi")
 	return cmd
 }
 
@@ -46,11 +48,12 @@ func runScan(cmd *cobra.Command, _ []string) error {
 	defer cancel()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	logger.Info("starting scan", "socket", socketPath, "vm", vmName, "address", targetAddress, "interval", sampleInterval)
+	interval := time.Duration(intervalMs) * time.Millisecond
+	logger.Info("starting scan", "socket", socketPath, "vm", vmName, "address", targetAddress, "interval", interval, "mock", mockMode)
 
-	engine := orchestrator.NewEngine(socketPath, vmName, logger)
+	engine := orchestrator.NewEngine(socketPath, vmName, mockMode, logger)
 
-	if err := engine.Stream(ctx, targetAddress, sampleInterval); err != nil && !errors.Is(err, context.Canceled) {
+	if err := engine.Stream(ctx, targetAddress, interval); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("streaming aborted", "err", err)
 		return err
 	}

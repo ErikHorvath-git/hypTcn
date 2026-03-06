@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -29,20 +30,29 @@ type prediction struct {
 
 // Engine manages the lifecycle of analysis requests via the analyzer service.
 type Engine struct {
-	socketPath string
-	vmName     string
-	logger     *slog.Logger
-	conn       net.Conn
-	reader     *bufio.Reader
+	socketPath   string
+	vmName       string
+	mock         bool
+	nextMockAddr uint64
+	logger       *slog.Logger
+	conn         net.Conn
+	reader       *bufio.Reader
 }
 
 // NewEngine builds a reusable Engine bound to a Unix domain socket.
-func NewEngine(socketPath, vmName string, logger *slog.Logger) *Engine {
+// When mock is true the engine generates synthetic frames instead of calling libvmi.
+func NewEngine(socketPath, vmName string, mock bool, logger *slog.Logger) *Engine {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	return &Engine{socketPath: socketPath, vmName: vmName, logger: logger}
+	return &Engine{
+		socketPath:   socketPath,
+		vmName:       vmName,
+		mock:         mock,
+		nextMockAddr: 0x1000,
+		logger:       logger,
+	}
 }
 
 // Analyze streams one framed page to the analyzer service and returns its prediction.
@@ -116,18 +126,34 @@ func (e *Engine) Stream(ctx context.Context, physicalAddress uint64, interval ti
 }
 
 func (e *Engine) captureAndAnalyze(ctx context.Context, physicalAddress uint64) error {
-	payload, err := extractor.ExtractPage(e.vmName, physicalAddress)
-	if err != nil {
-		return fmt.Errorf("extract page: %w", err)
+	var addr uint64
+	var payload []byte
+
+	if e.mock {
+		addr = e.nextMockAddr
+		e.nextMockAddr += 0x1000
+		payload = make([]byte, extractor.PageSize)
+		if _, err := rand.Read(payload); err != nil {
+			return fmt.Errorf("generate mock page: %w", err)
+		}
+	} else {
+		addr = physicalAddress
+		var err error
+		payload, err = extractor.ExtractPage(e.vmName, physicalAddress)
+		if err != nil {
+			return fmt.Errorf("extract page: %w", err)
+		}
 	}
 
-	e.logger.Debug("dispatching payload", "bytes", len(payload), "address", physicalAddress)
-	if _, err := e.Analyze(ctx, physicalAddress, payload); err != nil {
+	e.logger.Debug("dispatching payload", "bytes", len(payload), "address", addr)
+	if _, err := e.Analyze(ctx, addr, payload); err != nil {
 		return fmt.Errorf("analyzer: %w", err)
 	}
 
 	return nil
 }
+
+const maxConnAttempts = 3
 
 func (e *Engine) connect(ctx context.Context) error {
 	if e.conn != nil {
@@ -135,14 +161,26 @@ func (e *Engine) connect(ctx context.Context) error {
 	}
 
 	dialer := &net.Dialer{Timeout: dialTimeout}
-	conn, err := dialer.DialContext(ctx, "unix", e.socketPath)
-	if err != nil {
-		return fmt.Errorf("failed to dial analyzer socket %q: %w", e.socketPath, err)
+	var lastErr error
+	for attempt := 1; attempt <= maxConnAttempts; attempt++ {
+		conn, err := dialer.DialContext(ctx, "unix", e.socketPath)
+		if err == nil {
+			e.conn = conn
+			e.reader = bufio.NewReader(conn)
+			return nil
+		}
+		lastErr = err
+		e.logger.Warn("analyzer socket unavailable, retrying", "attempt", attempt, "of", maxConnAttempts, "err", err)
+		if attempt < maxConnAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Second):
+			}
+		}
 	}
 
-	e.conn = conn
-	e.reader = bufio.NewReader(conn)
-	return nil
+	return fmt.Errorf("failed to dial analyzer socket %q after %d attempts: %w", e.socketPath, maxConnAttempts, lastErr)
 }
 
 // Close tears down the persistent analyzer socket connection.
