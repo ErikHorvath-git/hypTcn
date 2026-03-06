@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-hypTCn is a hypervisor-aware security toolkit for live memory introspection on KVM guests. It uses Virtual Machine Introspection (VMI) via LibVMI to sample raw 4 KiB physical memory pages from a running virtual machine — entirely from outside the guest, with zero footprint inside the monitored system. Each sampled page is reduced to a 16-element semantic feature vector and fed into a sliding window of 16 frames. When the window is full, a PyTorch Temporal Convolutional Network (TCN) produces an anomaly score in [0.0, 1.0]. The goal is to detect Advanced Persistent Threats and malware — shellcode, rootkits, cryptominers — by observing physical memory patterns that are invisible to in-guest detection (which an attacker can disable) but unavoidable at the hypervisor boundary.
+hypTCn is a hypervisor-aware security toolkit for live memory introspection on KVM guests. It uses Virtual Machine Introspection (VMI) via LibVMI to sample raw 4 KiB physical memory pages from a running virtual machine — entirely from outside the guest, with zero footprint inside the monitored system. Each sampled page is reduced to an 18-element semantic feature vector (16 per-page features + 2 temporal delta features) and fed into a sliding window of 16 frames. When the window is full, a PyTorch Temporal Convolutional Network (TCN) produces an anomaly score in [0.0, 1.0]. The goal is to detect Advanced Persistent Threats and malware — shellcode, rootkits, cryptominers — by observing physical memory patterns that are invisible to in-guest detection (which an attacker can disable) but unavoidable at the hypervisor boundary.
 
 ---
 
@@ -61,15 +61,15 @@ hypTCn is a hypervisor-aware security toolkit for live memory introspection on K
                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Feature Extractor  feature_extractor.py                            │
-│  extract(page: bytes, address: int) → np.ndarray shape (16,)        │
-│  16 semantic features, all normalized to [0.0, 1.0]                │
+│  extract(page, address, prev_features) → np.ndarray shape (18,)     │
+│  18 semantic features, all normalized to [0.0, 1.0]                │
 └────────────────────────────┬────────────────────────────────────────┘
-                             │ (16,) vector appended to window
-                             │ when window full: np.stack → (16, 16)
+                             │ (18,) vector appended to window
+                             │ when window full: np.stack → (18, 16)
                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  TCN Model  tcn_model.py                                            │
-│  Input: (1, 16, 16)  — batch × features × sequence                 │
+│  Input: (1, 18, 16)  — batch × features × sequence                 │
 │  3 × TCNBlock (dilations 1, 2, 4) → GlobalAvgPool → Dense → Sigmoid│
 │  infer() → float score in [0.0, 1.0]                               │
 └────────────────────────────┬────────────────────────────────────────┘
@@ -188,9 +188,9 @@ Three targets: `all` builds `bin/hyptcn` with `CGO_LDFLAGS="-lvmi"` and a local 
 
 ---
 
-## Feature Vector (16 features per frame)
+## Feature Vector (18 features per frame)
 
-Each 4096-byte page and its physical address produce one float32 vector of shape `(16,)`. All values are in `[0.0, 1.0]`.
+Each 4096-byte page and its physical address produce one float32 vector of shape `(18,)`. All values are in `[0.0, 1.0]`.
 
 | # | Feature | Formula / Source | Malware Detection Relevance |
 |---|---------|------------------|-----------------------------|
@@ -210,6 +210,8 @@ Each 4096-byte page and its physical address produce one float32 vector of shape
 | 13 | `syscall_pattern_count` | count(0F 05 \| CD 80 \| 0F 34) / 100 | SYSCALL, INT 80h, SYSENTER opcodes; dense syscall sequences are a shellcode indicator |
 | 14 | `nop_sled_score` | bytes_in(0x90-runs > 8) / 4096 | Classic shellcode delivery mechanism; strong indicator of exploit staging in memory |
 | 15 | `string_density` | count(printable runs ≥ 4 bytes) / 100 | Dense string presence = config data, C2 URLs, commands; sparse = pure code or crypto |
+| 16 | `entropy_delta` | (H_t − H_{t-1}) clamped to [−1,1], shifted to [0,1] via (val+1)/2; first frame = 0.5 | Sudden entropy spikes (decompression, decryption) or drops (zeroing) are strong temporal indicators that a static per-frame view cannot capture |
+| 17 | `addr_delta` | (addr_t − addr_{t-1}) / 0xFFFFFFFFFFFF, clamped to [0,1]; first frame = 0.0 | Large address jumps between samples reveal scanner pattern or attacker jumping between memory regions; sequential scans stay near 0 |
 
 ---
 
@@ -218,10 +220,10 @@ Each 4096-byte page and its physical address produce one float32 vector of shape
 **File:** `tcn_model.py` — **Class:** `TCNAnomalyDetector`
 
 ```
-Input:  (batch=1, features=16, sequence=16)
-         └─ 16 feature dimensions × 16 frames in the sliding window
+Input:  (batch=1, features=18, sequence=16)
+         └─ 18 feature dimensions × 16 frames in the sliding window
 
-Block 0 — dilation=1  in_ch=16 → out_ch=32
+Block 0 — dilation=1  in_ch=18 → out_ch=32
 Block 1 — dilation=2  in_ch=32 → out_ch=32
 Block 2 — dilation=4  in_ch=32 → out_ch=32
 

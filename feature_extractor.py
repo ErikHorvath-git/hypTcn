@@ -1,13 +1,13 @@
 """Per-page feature extraction for the hypTcn TCN pipeline.
 
-Produces a 16-element float32 vector from a 4096-byte raw memory page
+Produces an 18-element float32 vector from a 4096-byte raw memory page
 and its physical address:
 
     Original 8:
         byte_entropy, nonzero_ratio, printable_ratio, high_byte_ratio,
         unique_bytes, top4_freq, zero_runs, addr_norm
 
-    New 8:
+    Structural 8:
         entropy_blocks_std  — std-dev of per-256B-block entropies (normalized)
         compression_ratio   — zlib compressed size / 4096
         null_run_ratio      — fraction of bytes inside zero-runs > 8 bytes
@@ -16,6 +16,10 @@ and its physical address:
         syscall_pattern_count — x86 syscall opcodes per page / 100
         nop_sled_score      — fraction of bytes inside 0x90-runs > 8 bytes
         string_density      — count of printable-ASCII strings ≥ 4 bytes / 100
+
+    Temporal 2 (require prev_features from previous frame):
+        entropy_delta — byte_entropy change T→T-1, shifted to [0,1]
+        addr_delta    — physical address jump T→T-1, clamped to [0,1]
 """
 
 from __future__ import annotations
@@ -25,21 +29,28 @@ import zlib
 import numpy as np
 
 PAGE_SIZE = 4096
-FEATURE_DIM = 16
+FEATURE_DIM = 18
 _ADDR_MAX = float(0xFFFFFFFFFFFF)  # 48-bit physical address space
 _N_BLOCKS = 16
 _BLOCK_SIZE = PAGE_SIZE // _N_BLOCKS  # 256 bytes per block
 
 
-def extract(page: bytes, address: int) -> np.ndarray:
-    """Return shape-(16,) float32 feature vector for one page.
+def extract(
+    page: bytes,
+    address: int,
+    prev_features: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return shape-(18,) float32 feature vector for one page.
 
     Args:
-        page:    Exactly 4096 raw bytes from the guest's physical memory.
-        address: Physical address the page was read from.
+        page:          Exactly 4096 raw bytes from the guest's physical memory.
+        address:       Physical address the page was read from.
+        prev_features: Feature vector from the immediately preceding frame
+                       (shape (18,) or (16,)), or None for the first frame.
+                       Used to compute entropy_delta and addr_delta.
 
     Returns:
-        numpy array of shape (16,), dtype float32, all values in [0, 1].
+        numpy array of shape (18,), dtype float32, all values in [0, 1].
     """
     if len(page) != PAGE_SIZE:
         raise ValueError(f"expected {PAGE_SIZE}-byte page, got {len(page)}")
@@ -104,11 +115,30 @@ def extract(page: bytes, address: int) -> np.ndarray:
     # Count of printable-ASCII strings ≥ 4 bytes, normalized by 100
     string_density = min(float(_count_strings(arr, min_len=4)) / 100.0, 1.0)
 
+    # ── temporal 2 features (require previous frame) ──────────────────────────
+
+    if prev_features is None:
+        # First frame: neutral mid-point for delta, zero for address jump
+        entropy_delta = 0.5
+        addr_delta = 0.0
+    else:
+        # byte_entropy is always index 0 regardless of vector length
+        prev_entropy = float(prev_features[0])
+        raw_delta = byte_entropy - prev_entropy          # in [-1.0, 1.0]
+        clamped = max(-1.0, min(1.0, raw_delta))
+        entropy_delta = (clamped + 1.0) / 2.0           # shift to [0.0, 1.0]
+
+        # addr_norm is index 7; reconstruct absolute address from it for delta
+        prev_addr = float(prev_features[7]) * _ADDR_MAX
+        raw_addr_delta = (float(address) - prev_addr) / _ADDR_MAX
+        addr_delta = max(0.0, min(1.0, raw_addr_delta))
+
     return np.array(
         [byte_entropy, nonzero_ratio, printable_ratio, high_byte_ratio,
          unique_bytes, top4_freq, zero_runs, addr_norm,
          entropy_blocks_std, compression_ratio, null_run_ratio, pe_header_score,
-         elf_header_score, syscall_pattern_count, nop_sled_score, string_density],
+         elf_header_score, syscall_pattern_count, nop_sled_score, string_density,
+         entropy_delta, addr_delta],
         dtype=np.float32,
     )
 

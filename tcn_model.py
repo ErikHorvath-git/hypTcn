@@ -1,6 +1,6 @@
 """Standalone TCN anomaly-detection model for the hypTcn pipeline.
 
-Input:  (batch, features=16, sequence=16)  — one sliding window of pages
+Input:  (batch, features=18, sequence=16)  — one sliding window of pages
 Output: float in [0.0, 1.0]               — anomaly score (sigmoid)
 
 Architecture per spec:
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
-FEATURE_DIM = 16
+FEATURE_DIM = 18
 SEQUENCE_LENGTH = 16
 KERNEL_SIZE = 3
 NUM_BLOCKS = 3
@@ -142,7 +142,7 @@ def infer(model: TCNAnomalyDetector, window: "np.ndarray") -> float:
 
     Args:
         model:  An eval-mode TCNAnomalyDetector.
-        window: numpy array of shape (FEATURE_DIM, SEQUENCE_LENGTH) = (16, 16).
+        window: numpy array of shape (FEATURE_DIM, SEQUENCE_LENGTH) = (18, 16).
                 Accepts (SEQUENCE_LENGTH, FEATURE_DIM) too and transposes automatically.
 
     Returns:
@@ -150,7 +150,7 @@ def infer(model: TCNAnomalyDetector, window: "np.ndarray") -> float:
     """
     if window.shape == (SEQUENCE_LENGTH, FEATURE_DIM):
         window = window.T  # → (FEATURE_DIM, SEQUENCE_LENGTH)
-    tensor = torch.from_numpy(window).unsqueeze(0).float()  # (1, 16, 16)
+    tensor = torch.from_numpy(window).unsqueeze(0).float()  # (1, 18, 16)
     with torch.no_grad():
         score = model(tensor)
     return float(score.squeeze().item())
