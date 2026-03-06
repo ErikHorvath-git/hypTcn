@@ -28,6 +28,14 @@ func (f *FlagSet) DurationVar(p *time.Duration, name string, value time.Duration
 	f.fs.DurationVar(p, name, value, usage)
 }
 
+func (f *FlagSet) IntVar(p *int, name string, value int, usage string) {
+	f.fs.IntVar(p, name, value, usage)
+}
+
+func (f *FlagSet) BoolVar(p *bool, name string, value bool, usage string) {
+	f.fs.BoolVar(p, name, value, usage)
+}
+
 func (f *FlagSet) Parse(args []string) error {
 	return f.fs.Parse(args)
 }
