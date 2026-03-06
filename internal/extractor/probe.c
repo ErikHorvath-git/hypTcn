@@ -11,7 +11,7 @@ int fetch_guest_page(const char* vm_name, uint64_t physical_address, unsigned ch
     }
 
     vmi_instance_t vmi = NULL;
-    if (vmi_init(&vmi, VMI_KVM, vm_name, VMI_INIT_NAME, NULL, NULL) == VMI_FAILURE) {
+    if (vmi_init(&vmi, VMI_KVM, vm_name, VMI_INIT_DOMAINNAME, NULL, NULL) == VMI_FAILURE) {
         return HYPTCN_INIT_ERROR;
     }
 
