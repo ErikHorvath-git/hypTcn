@@ -29,3 +29,7 @@ venv/
 # Bytecode
 __pycache__/
 *.pyc
+
+
+#claude conf
+.claude
