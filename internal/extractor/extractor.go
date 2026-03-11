@@ -15,24 +15,42 @@ import (
 
 const PageSize = int(C.HYPTCN_PAGE_SIZE)
 
-// ExtractPage uses the CGO bridge into libvmi to read a single 4 KiB page.
-func ExtractPage(vmName string, address uint64) ([]byte, error) {
+// Handle wraps the persistent libvmi connection.
+type Handle struct {
+	ptr *C.hyptcn_vmi_handle_t
+}
+
+// Open connects to the named KVM guest via libvmi. The caller must call
+// Close() when done, typically via defer.
+func Open(vmName string) (*Handle, error) {
 	if vmName == "" {
 		return nil, fmt.Errorf("vm name is required")
 	}
-
-	buf := make([]byte, PageSize)
-	if len(buf) != PageSize {
-		return nil, fmt.Errorf("failed to allocate %d-byte buffer", PageSize)
-	}
-
 	cname := C.CString(vmName)
 	defer C.free(unsafe.Pointer(cname))
 
-	res := C.fetch_guest_page(cname, C.uint64_t(address), (*C.uchar)(unsafe.Pointer(&buf[0])))
-	if res != 0 {
-		return nil, fmt.Errorf("fetch_guest_page returned %d", int(res))
+	ptr := C.hyptcn_vmi_open(cname)
+	if ptr == nil {
+		return nil, fmt.Errorf("hyptcn_vmi_open failed for %q", vmName)
 	}
+	return &Handle{ptr: ptr}, nil
+}
 
+// ReadPage reads exactly PageSize bytes from physicalAddress into a new buffer.
+func (h *Handle) ReadPage(physicalAddress uint64) ([]byte, error) {
+	buf := make([]byte, PageSize)
+	res := C.hyptcn_read_page(h.ptr, C.uint64_t(physicalAddress),
+		(*C.uchar)(unsafe.Pointer(&buf[0])))
+	if res != 0 {
+		return nil, fmt.Errorf("hyptcn_read_page returned %d", int(res))
+	}
 	return buf, nil
+}
+
+// Close destroys the libvmi connection and frees the handle.
+func (h *Handle) Close() {
+	if h.ptr != nil {
+		C.hyptcn_vmi_close(h.ptr)
+		h.ptr = nil
+	}
 }
