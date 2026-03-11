@@ -1,432 +1,728 @@
-# hypTCn
+# hypTcn
 
-## Project Overview
-
-hypTCn is a hypervisor-aware security toolkit for live memory introspection on KVM guests. It uses Virtual Machine Introspection (VMI) via LibVMI to sample raw 4 KiB physical memory pages from a running virtual machine — entirely from outside the guest, with zero footprint inside the monitored system. Each sampled page is reduced to an 18-element semantic feature vector (16 per-page features + 2 temporal delta features) and fed into a sliding window of 16 frames. When the window is full, a PyTorch Temporal Convolutional Network (TCN) produces an anomaly score in [0.0, 1.0]. The goal is to detect Advanced Persistent Threats and malware — shellcode, rootkits, cryptominers — by observing physical memory patterns that are invisible to in-guest detection (which an attacker can disable) but unavoidable at the hypervisor boundary.
+Hypervisor-aware memory introspection with a Temporal Convolutional Network anomaly detector.
 
 ---
 
-## Architecture
+## 1. Project Overview
+
+hypTcn samples raw 4 KiB physical memory pages from a running KVM guest — from outside the
+VM, at the hypervisor boundary — and classifies each sliding window of 16 consecutive pages
+as normal or anomalous using a PyTorch TCN.
+
+**Why VMI + TCN?**
+
+- **Zero footprint inside the guest.** No agent, no kernel module, no hooks inside the VM.
+  The guest cannot detect or tamper with the observer because introspection runs entirely in
+  the host process via libvmi → QEMU QMP.
+- **Temporal patterns matter.** A single page snapshot is ambiguous; a sequence of 16 pages
+  from the same physical region captures behavior over time — entropy drift, address-scanning
+  patterns, NOP-sled presence across frames — which is what the TCN is designed to model.
+- **APT detection goal.** Advanced persistent threats stage shellcode or packed loaders in
+  memory regions that briefly look anomalous. Scanning at the hypervisor level and
+  correlating over time (rather than inspecting syscalls, which are trivially spoofed)
+  is a complementary detection layer that survives most in-guest evasion.
+
+**Current state (tested 2026-03-11):**
+- Live VM introspection works end-to-end against `hyptcn-guest` (Debian 12, QEMU/KVM).
+- The model is trained on **synthetic** data. Live VM scores are 0.0 because real memory
+  pages are not yet labeled. See §10 and §12.
+
+---
+
+## 2. Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  KVM Guest (monitored, zero-footprint)                              │
-│  Physical RAM ──────────────────────────────────────────────────┐   │
-└─────────────────────────────────────────────────────────────────│───┘
-                         Hypervisor Boundary                      │
-                    (LibVMI crosses here via KVM API)             │
-                                                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Go CLI  cmd/hyptcn/main.go                                         │
-│  Flags: --vm, --address, --interval, --socket, --mock               │
-│  Signal handling: SIGINT/SIGTERM → graceful shutdown                │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │ calls
-                             ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Go Orchestrator  internal/orchestrator/engine.go                   │
-│  Engine.Stream()  →  ticker loop at --interval ms                   │
-│  Engine.captureAndAnalyze()                                         │
-│    mock=false: calls extractor.ExtractPage() → LibVMI               │
-│    mock=true:  crypto/rand fills 4096 bytes, sequential addresses   │
-│  Engine.connect()  →  UDS dial with 3 retries × 1s delay           │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │ CGO call (non-mock path)
-                             ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  C Extractor  internal/extractor/                                   │
-│  extractor.go: CGO bridge, exposes ExtractPage(vmName, addr)        │
-│  probe.c:      vmi_init(VMI_KVM, VMI_INIT_DOMAINNAME)              │
-│                vmi_read_pa(vmi, physical_address, 4096, buf)        │
-│                vmi_destroy(vmi)                                     │
-└─────────────────────────────────────────────────────────────────────┘
-                             │
-                             │ Frame written to UDS socket
-                             │ ┌────────────────────────────────────┐
-                             │ │  [8 bytes: uint64 LE address]      │
-                             │ │  [4096 bytes: raw page data]       │
-                             │ │  ─────────────────────────────     │
-                             │ │  Total: 4104 bytes per frame       │
-                             │ └────────────────────────────────────┘
-                             ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Python Analyzer  python/analyzer.py                                │
-│  asyncio UDS server on /tmp/hyptcn.sock                             │
-│  _iter_frames(): readexactly(8) + readexactly(4096) per frame       │
-│  Sliding window: deque(maxlen=16) of feature vectors                │
-│    frames < 16: emit {"status":"warming_up","frames":n}             │
-│    frames = 16: run TCN inference                                   │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │ calls
-                             ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Feature Extractor  python/model/features.py                        │
-│  extract(page, address, prev_features) → np.ndarray shape (18,)     │
-│  18 semantic features, all normalized to [0.0, 1.0]                │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │ (18,) vector appended to window
-                             │ when window full: np.stack → (18, 16)
-                             ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  TCN Model  python/model/tcn.py                                     │
-│  Input: (1, 18, 16)  — batch × features × sequence                 │
-│  3 × TCNBlock (dilations 1, 2, 4) → GlobalAvgPool → Dense → Sigmoid│
-│  infer() → float score in [0.0, 1.0]                               │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │
-                             ▼
-          JSON to stdout + socket response
-          {"timestamp":…, "addr":"0x…", "score":0.496, "alert":false}
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  KVM Guest  (hyptcn-guest, Debian 12, 2 GiB RAM)                            │
+│  Physical RAM — zero footprint, no agent, not detectable from inside         │
+└───────────────────────┬──────────────────────────────────────────────────────┘
+                        │  hypervisor boundary
+                        │  libvmi vmi_read_pa()
+                        │  KVM legacy driver → qemu:///session → QMP xp command
+                        ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  C Extractor   internal/extractor/probe.c + probe.h                          │
+│                                                                              │
+│  hyptcn_vmi_open(vm_name)                                                    │
+│    → vmi_init(&vmi, VMI_KVM, name, VMI_INIT_DOMAINNAME, NULL, NULL)          │
+│       (no /etc/libvmi.conf — raw PA reads only, OS-layer init skipped)       │
+│  hyptcn_read_page(handle, phys_addr, buf) → vmi_read_pa(…, 4096, …)         │
+│  hyptcn_vmi_close(handle)  → vmi_destroy()                                  │
+└───────────────────────┬──────────────────────────────────────────────────────┘
+                        │  CGO
+                        │  CGO_CFLAGS  = -I/usr/local/include
+                        │  CGO_LDFLAGS = -L/usr/local/lib64 -lvmi
+                        │               -Wl,-rpath,/usr/local/lib64
+                        ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Go Orchestrator   internal/orchestrator/engine.go                           │
+│                                                                              │
+│  Engine.Stream(ctx, physAddr, interval)                                      │
+│    → extractor.Open(vmName)   one persistent libvmi handle                   │
+│    → ticker every interval ms                                                │
+│         extractor.ReadPage(physAddr)  → 4096 bytes                          │
+│         Engine.Analyze(ctx, addr, payload)                                   │
+│           → lazy UDS connect (3 attempts, 1s back-off each)                 │
+│           → write frame: [8B addr LE][4096B page] = 4104 bytes              │
+│           → read newline-terminated JSON response                           │
+│           → log via slog                                                    │
+│    → Engine.Close() on exit: vmi_destroy + close UDS                        │
+│                                                                              │
+│  Mock mode (--mock): crypto/rand fills pages, addr += 0x1000 each frame     │
+└───────────────────────┬──────────────────────────────────────────────────────┘
+                        │  Unix Domain Socket  /tmp/hyptcn.sock
+                        │
+                        │  Frame wire format (4104 bytes, no delimiter):
+                        │    bytes  0–7    physical address (uint64, little-endian)
+                        │    bytes  8–4103 raw page content (4096 bytes)
+                        ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Python Analyzer   python/analyzer.py                                        │
+│                                                                              │
+│  asyncio UDS server, one _handle() coroutine per Go connection               │
+│                                                                              │
+│  Per frame:                                                                  │
+│    1. readexactly(8) + readexactly(4096)                                    │
+│    2. features.extract(page, addr, prev_features) → (18,) float32           │
+│    3. window.append(vec)   deque maxlen=16                                   │
+│    4. if log_dir: np.save(<log_dir>/<label>/<ts>_<addr>.npy)                │
+│    5. len(window) < 16 → socket: {"anomaly_score":0.0,"status":"warming_up"}│
+│       len(window) = 16 → seq = stack(window) shape (18,16)                  │
+│                           score = tcn.infer(model, seq)                     │
+│                           socket: {"anomaly_score":<f>,"status":"ok"}       │
+│                           stdout: {"timestamp":…,"addr":…,"score":…,        │
+│                                   "alert":<score>0.85,"status":"ok"}        │
+└───────────────────────┬──────────────────────────────────────────────────────┘
+                        │  PyTorch inference  ~0.34 ms/window (CPU)
+                        ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  TCN Model   python/model/tcn.py                                             │
+│                                                                              │
+│  Input  (1, 18, 16) — batch=1, features=18, time_steps=16                   │
+│  Block 0  _TCNBlock(18→32, dilation=1)  + 1×1 projection residual           │
+│  Block 1  _TCNBlock(32→32, dilation=2)  + identity residual                 │
+│  Block 2  _TCNBlock(32→32, dilation=4)  + identity residual                 │
+│  AdaptiveAvgPool1d(1) → Flatten → Linear(32→16,ReLU) → Linear(16→1)        │
+│  sigmoid(logit) → anomaly score ∈ [0.0, 1.0]                               │
+│                                                                              │
+│  Weights: models/tcn_weights.pt   Config: models/config.json               │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Frame format:** `[8B physical address, little-endian uint64][4096B raw page] = 4104 bytes`
-
-**Sliding window:** 16 frames → 1 TCN inference. The window is a `deque(maxlen=16)`; new frames push old ones out. The TCN sees a short-term temporal trace of how a memory region evolves over time.
-
-**Hypervisor boundary concept:** LibVMI uses the KVM API from the host side to read guest physical memory without injecting any agent or kernel module into the guest. The guest cannot detect or interfere with the observation. A rootkit that hides from the guest OS's `/proc` remains fully visible as physical memory pages.
-
-**UDS retry logic:** `Engine.connect()` retries up to 3 times with a 1-second delay between attempts, logging each failure. This lets you start the Go binary before the Python service is fully up. After 3 failures it exits with an error rather than hanging.
+**UDS retry logic:** `Engine.connect()` retries up to 3 times with 1-second gaps.
+The connection is kept open across frames and only re-dialed after a failure.
+Deadlines: dial 5s, write 10s, read 10s.
 
 ---
 
-## Components
+## 3. Components
 
-### `cmd/hyptcn/main.go`
+### `internal/extractor/probe.h` + `probe.c`
 
-Entry point. Registers the Cobra CLI command and flags, installs a `signal.NotifyContext` for SIGINT/SIGTERM, constructs an `orchestrator.Engine`, and calls `engine.Stream()`. Translates the `--interval` integer (milliseconds) into a `time.Duration`.
+C wrapper around libvmi. Opaque persistent handle.
 
-**Key items:** `newRootCmd()`, `runScan()`, global flag vars (`socketPath`, `vmName`, `targetAddress`, `intervalMs`, `mockMode`).
+| Function | What it does |
+|---|---|
+| `hyptcn_vmi_open(vm_name)` | `vmi_init(VMI_KVM, VMI_INIT_DOMAINNAME, NULL, NULL)`. KVM legacy driver via `qemu:///session`. Returns NULL on failure. |
+| `hyptcn_read_page(handle, addr, buf)` | `vmi_read_pa` for exactly 4096 bytes. Returns 0 / -1 (bad args) / -2 (libvmi error). |
+| `hyptcn_vmi_close(handle)` | `vmi_destroy` + free. NULL-safe. |
 
-**Connects to:** `internal/orchestrator/engine.go` via `orchestrator.NewEngine()`.
-
----
-
-### `internal/orchestrator/engine.go`
-
-The main control loop. `Engine.Stream()` fires a ticker at the configured interval and calls `captureAndAnalyze()` each tick. In real mode it calls `extractor.ExtractPage()`; in mock mode it fills a buffer from `crypto/rand` and increments `nextMockAddr` by `0x1000` per frame. `Analyze()` frames the page as `[8B addr][4096B data]`, writes it to the persistent UDS connection, then blocks on `reader.ReadBytes('\n')` waiting for the JSON response. Deadlines are applied per-operation (10s write, 10s read). `connect()` manages the single persistent connection with 3-attempt retry.
-
-**Key items:** `Engine` struct, `Stream()`, `Analyze()`, `captureAndAnalyze()`, `connect()`, `writeAll()`, `prediction` struct (`anomaly_score`, `status`).
-
-**Connects to:** `internal/extractor/extractor.go` (page reads) and the Python analyzer over UDS.
+`vmi_init` (not `vmi_init_complete`) is used deliberately — raw PA reads require no
+System.map, rekall profile, or `/etc/libvmi.conf`. Connects to → `extractor.go`.
 
 ---
 
 ### `internal/extractor/extractor.go`
 
-CGO bridge. Exposes `ExtractPage(vmName string, address uint64) ([]byte, error)` to Go. Allocates a 4096-byte buffer, calls `C.fetch_guest_page()`, and returns the buffer or an error code. The `PageSize` constant is derived directly from the C header (`HYPTCN_PAGE_SIZE = 4096`).
+CGO bridge.
 
-**Key items:** `ExtractPage()`, `PageSize`.
+```
+cgo CFLAGS:  -I${SRCDIR}
+cgo LDFLAGS: -lvmi   (Makefile overrides to /usr/local paths + rpath)
+```
 
-**Connects to:** `probe.c` via CGO; called by `engine.go`.
+| Export | Description |
+|---|---|
+| `Open(vmName string) (*Handle, error)` | Caller must `defer h.Close()`. |
+| `(*Handle).ReadPage(addr uint64) ([]byte, error)` | Always 4096 bytes on success. |
+| `(*Handle).Close()` | Idempotent. |
+| `PageSize int` | 4096. |
+
+Connects to → `engine.go`.
 
 ---
 
-### `internal/extractor/probe.c` + `probe.h`
+### `internal/orchestrator/engine.go`
 
-C wrapper around LibVMI. `fetch_guest_page(vm_name, physical_address, buffer)`:
-1. Validates non-null arguments.
-2. Calls `vmi_init(&vmi, VMI_KVM, vm_name, VMI_INIT_DOMAINNAME, NULL, NULL)` — connects to the KVM guest by domain name.
-3. Calls `vmi_read_pa(vmi, physical_address, 4096, buffer, NULL)` — reads exactly one physical page.
-4. Calls `vmi_destroy(vmi)` — releases the VMI instance.
-5. Returns `0` on success, `-1` (init error) or `-2` (read error) on failure.
+Runtime loop and UDS client.
 
-`probe.h` defines `HYPTCN_PAGE_SIZE 4096` and the function prototype, guarded by `extern "C"` for C++ compatibility.
+| Item | Detail |
+|---|---|
+| `NewEngine(socketPath, vmName, mock, logger)` | nil logger → discard. Mock starts `nextMockAddr = 0x1000`. |
+| `Stream(ctx, physAddr, interval)` | Opens VMI (non-mock), initial capture, ticker loop, `Close()` on return. |
+| `Analyze(ctx, addr, payload)` | Frames 4104 bytes, sends, reads one JSON line. |
+| `connect(ctx)` | Lazy. 3 attempts × 1s gap × 5s dial timeout. |
+| `Close()` | VMI handle + UDS. |
+| Mock mode | `crypto/rand.Read` for page bytes; addr walks +0x1000/frame. |
 
-**Key items:** `fetch_guest_page()`, `HYPTCN_INIT_ERROR (-1)`, `HYPTCN_READ_ERROR (-2)`, `HYPTCN_PAGE_SIZE (4096)`.
+Connects to → `main.go` (called by) and → Python analyzer (UDS).
 
-**Connects to:** LibVMI system library (`-lvmi`); called by `extractor.go`.
+---
+
+### `cmd/hyptcn/main.go`
+
+Cobra CLI. `SIGINT`/`SIGTERM` via `signal.NotifyContext`. Logs to stderr via `log/slog`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--socket` | `/tmp/hyptcn.sock` | UDS path |
+| `--vm` | `guest` | libvmi domain name |
+| `--address` | `0x1000` | Physical address to sample |
+| `--interval` | `100` | Milliseconds between samples |
+| `--mock` | `false` | Use random pages instead of libvmi |
+
+Module: `github.com/example/hypTcn`. Cobra vendored under `third_party/`.
 
 ---
 
 ### `python/analyzer.py`
 
-The active analyzer service. An asyncio UDS server that accepts one persistent connection from the Go binary per run. `_iter_frames()` reads frames with `readexactly(8)` + `readexactly(4096)`, unpacking the address with `struct.unpack("<Q", header)`. Per frame, it calls `feature_extractor.extract()`, appends the result to a `deque(maxlen=16)`, and either emits a warming-up response or stacks the deque into a `(18, 16)` array and runs `tcn_model.infer()`. Both the socket response and stdout receive the same JSON. The model is loaded once at startup via `tcn_model.load_model()`.
+asyncio UDS server. One coroutine per accepted connection.
 
-**Key items:** `_iter_frames()`, `_handle()`, `_serve()`, `ALERT_THRESHOLD = 0.85`, `FRAME_SIZE = 4104`, `SEQUENCE_LENGTH = 16`.
+| Flag | Default | Description |
+|---|---|---|
+| `--socket` | `/tmp/hyptcn.sock` | UDS listen path |
+| `--log-dir` | None | Save `.npy` frame files here |
+| `--label` | `unknown` | Subdirectory: `normal`, `malware`, or custom |
 
-**Connects to:** `python/model/features.py` and `python/model/tcn.py`; responds to `engine.go` over UDS.
+**Startup:** removes stale socket, loads model + config.json once, prints version.
+
+**Log file format:** `<log_dir>/<label>/<timestamp_ms>_<addr_hex16>.npy`
+Dict keys: `features (18,)`, `addr int`, `timestamp_ms int`, `raw_page (4096,) uint8`.
+
+Alert threshold: from `config.json`; fallback `0.85`.
 
 ---
 
 ### `python/model/features.py`
 
-Pure Python/NumPy feature extraction. `extract(page, address, prev_features)` converts a 4096-byte page into a shape-`(18,)` float32 array. All values are normalized to `[0.0, 1.0]`. Helper functions are private (`_`-prefixed) and operate on NumPy arrays for performance. `_run_boundaries()` is the shared primitive underlying all run-length based features, using sentinel padding and `np.diff` to find run starts and ends without Python loops over bytes.
+Stateless numpy feature extractor. All outputs clamped to `[0, 1]`.
 
-**Key items:** `extract()`, `FEATURE_DIM = 18`, `_run_boundaries()`, `_bytes_in_runs()`, `_block_entropy()`, `_pe_header_score()`, `_elf_header_score()`, `_syscall_pattern_count()`, `_count_strings()`.
+```python
+extract(page: bytes, address: int, prev_features: np.ndarray | None) -> np.ndarray  # (18,) float32
+```
 
-**Connects to:** called by `python/analyzer.py`; produces input for `tcn_model.infer()`.
+See §4 for the full feature table.
 
 ---
 
 ### `python/model/tcn.py`
 
-Standalone PyTorch model. `TCNAnomalyDetector` stacks three `_TCNBlock` instances, applies global average pooling, then two linear layers with sigmoid output. `load_model()` returns an eval-mode instance, loading weights from `models/tcn_weights.pt` if the file exists. `infer(model, window)` accepts a `(18, 16)` NumPy array (or transposed), unsqueezes to `(1, 18, 16)`, runs the forward pass under `torch.no_grad()`, and returns a Python float.
+PyTorch model + inference API.
 
-**Key items:** `TCNAnomalyDetector`, `_TCNBlock`, `_CausalConv1d`, `load_model()`, `infer()`, `WEIGHTS_PATH`, `FEATURE_DIM = 18`, `SEQUENCE_LENGTH = 16`, `FILTERS = 32`.
-
-**Connects to:** called by `python/analyzer.py`; weights loaded from `models/tcn_weights.pt`.
-
----
-
-### `python/` (Python package root)
-
-Contains the full Python pipeline. `python/analyzer.py` is the entry point; `python/model/` holds `tcn.py` (model) and `features.py` (feature extraction). Run from the repo root as `.venv/bin/python python/analyzer.py`.
-
-**Files:** `analyzer.py`, `model/__init__.py`, `model/tcn.py`, `model/features.py`, `requirements.txt`.
+| Export | Description |
+|---|---|
+| `TCNAnomalyDetector` | Model class. `forward(x)` → raw logit. |
+| `load_model(weights_path)` | Reads config.json → builds matching arch → loads weights. Eval mode. |
+| `save_model(model, path)` | `torch.save(state_dict)`. |
+| `infer(model, window)` | Accepts `(18,16)` or `(16,18)`, applies sigmoid, returns `float`. |
 
 ---
 
-### `third_party/github.com/spf13/cobra/`
+### `python/model/__init__.py`
 
-Minimal vendored stub of the Cobra CLI library. Implements `Command` (with `Execute()`, `Flags()`, `RunE`) and `FlagSet` wrapping Go's stdlib `flag.FlagSet`. Only the flag types used by `main.go` are present: `StringVar`, `Uint64Var`, `IntVar`, `BoolVar`, `DurationVar`. The Go module uses a `replace` directive to point at this local copy instead of fetching Cobra from the network.
-
----
-
-### `Makefile`
-
-Three targets: `all` builds `bin/hyptcn` with `CGO_LDFLAGS="-lvmi"` and a local GOCACHE/GOPATH under `.cache/`; `deps` creates `.venv` and installs `python/requirements.txt`; `python-service` runs `python/analyzer.py`. `clean` removes `bin/`, `.venv/`, `.cache/`.
+Re-exports: `TCNAnomalyDetector`, `load_model`, `save_model`, `infer`, `extract`,
+`FEATURE_DIM=18`, `SEQUENCE_LENGTH=16`.
 
 ---
 
-## Feature Vector (18 features per frame)
+### `training/synthetic.py`
 
-Each 4096-byte page and its physical address produce one float32 vector of shape `(18,)`. All values are in `[0.0, 1.0]`.
+Generates labeled synthetic frame sequences — no live VM needed.
 
-| # | Feature | Formula / Source | Malware Detection Relevance |
-|---|---------|------------------|-----------------------------|
-| 0 | `byte_entropy` | Shannon H(page) / 8 | Packed/encrypted payloads have H ≈ 1.0; zero-filled pages have H ≈ 0.0; code has H ≈ 0.6–0.8 |
-| 1 | `nonzero_ratio` | count(byte ≠ 0) / 4096 | Unallocated or BSS pages are mostly zero; active code/heap pages are not |
-| 2 | `printable_ratio` | count(0x20 ≤ b ≤ 0x7E) / 4096 | High in string-heavy pages (config, paths); low in binary code or crypto |
-| 3 | `high_byte_ratio` | count(b > 0x7F) / 4096 | High in encrypted blobs or multi-byte encodings; distinguishes from ASCII code |
-| 4 | `unique_bytes` | count(distinct byte values) / 256 | Random or encrypted data uses all 256 values; NOP sleds and zero-runs do not |
-| 5 | `top4_freq` | sum(4 largest byte counts) / 4096 | NOP sleds, zero pages, or single-byte XOR ciphers show extreme dominance of one byte |
-| 6 | `zero_runs` | count(zero-runs > 8 bytes) / 100 | Long zero runs indicate uninitialized memory or padding; their temporal change is meaningful |
-| 7 | `addr_norm` | physical_address / 0xFFFFFFFFFFFF | Physical address position correlates with page type (low phys = kernel, high = userspace heap) |
-| 8 | `entropy_blocks_std` | std(H per 256B block) / 0.5 | High std means a mixed page: e.g. a plaintext header followed by an encrypted payload |
-| 9 | `compression_ratio` | len(zlib(page, level=1)) / 4096 | Low = repetitive (NOP sled, zeros); high = random/compressed (crypto, packed PE) |
-| 10 | `null_run_ratio` | bytes_in(zero-runs > 8) / 4096 | Distinct from `zero_runs`: measures coverage not count; large BSS regions score high |
-| 11 | `pe_header_score` | 0.0 / 0.5 / 1.0 — MZ magic + PE\0\0 at e_lfanew | Detects injected PE images or reflective DLL loading in guest RAM |
-| 12 | `elf_header_score` | 0.0 / 0.5 / 1.0 — \x7fELF magic + valid EI_CLASS | Detects ELF binaries mapped into memory; useful for Linux userspace injection |
-| 13 | `syscall_pattern_count` | count(0F 05 \| CD 80 \| 0F 34) / 100 | SYSCALL, INT 80h, SYSENTER opcodes; dense syscall sequences are a shellcode indicator |
-| 14 | `nop_sled_score` | bytes_in(0x90-runs > 8) / 4096 | Classic shellcode delivery mechanism; strong indicator of exploit staging in memory |
-| 15 | `string_density` | count(printable runs ≥ 4 bytes) / 100 | Dense string presence = config data, C2 URLs, commands; sparse = pure code or crypto |
-| 16 | `entropy_delta` | (H_t − H_{t-1}) clamped to [−1,1], shifted to [0,1] via (val+1)/2; first frame = 0.5 | Sudden entropy spikes (decompression, decryption) or drops (zeroing) are strong temporal indicators that a static per-frame view cannot capture |
-| 17 | `addr_delta` | (addr_t − addr_{t-1}) / 0xFFFFFFFFFFFF, clamped to [0,1]; first frame = 0.0 | Large address jumps between samples reveal scanner pattern or attacker jumping between memory regions; sequential scans stay near 0 |
-
----
-
-## TCN Model Architecture
-
-**File:** `python/model/tcn.py` — **Class:** `TCNAnomalyDetector`
-
-```
-Input:  (batch=1, features=18, sequence=16)
-         └─ 18 feature dimensions × 16 frames in the sliding window
-
-Block 0 — dilation=1  in_ch=18 → out_ch=32
-Block 1 — dilation=2  in_ch=32 → out_ch=32
-Block 2 — dilation=4  in_ch=32 → out_ch=32
-
-Each _TCNBlock:
-  conv1: weight_norm(CausalConv1d(in_ch, 32, kernel=3, dilation=d))
-  ReLU → Dropout(0.1)
-  conv2: weight_norm(CausalConv1d(32, 32, kernel=3, dilation=d))
-  ReLU → Dropout(0.1)
-  residual: Identity() if in_ch==32, else Conv1d(in_ch, 32, kernel=1)
-  output: ReLU(conv_out + residual)
-
-CausalConv1d (_CausalConv1d):
-  padding = (kernel_size - 1) × dilation
-  output = conv(x)[:, :, :-padding]   →  strictly causal, no future leakage
-
-After 3 blocks:
-  AdaptiveAvgPool1d(1)    →  (batch, 32, 1)
-  Flatten()               →  (batch, 32)
-  Linear(32, 16) + ReLU   →  (batch, 16)
-  Linear(16,  1) + Sigmoid →  (batch,  1)
-  squeeze(-1)             →  (batch,)  ∈ [0.0, 1.0]
-```
-
-**Effective receptive field:** With dilations 1, 2, 4 and kernel size 3, each block adds `(3−1) × dilation` steps of context. The combined receptive field covers the full 16-frame window.
-
-**Weight normalization:** Applied to both convolutions in every block via `torch.nn.utils.weight_norm`, decoupling weight magnitude from direction to stabilize training.
-
-**Weights:** Saved to / loaded from `models/tcn_weights.pt` using `torch.save(model.state_dict(), …)` / `torch.load(…, weights_only=True)`. When the file does not exist, weights are random (PyTorch default initialization). The model produces valid scores with random weights — they just carry no meaningful signal until training.
-
-**Alert threshold:** `score > 0.85` triggers `"alert": true` in the JSON output.
-
----
-
-## Installation & Build
-
-### 1. System dependencies
+5 archetypes: **normal** (low entropy, null-heavy), **shellcode** (high entropy, NOP sled,
+syscall opcodes), **packed_pe** (PE magic, high compression ratio), **cryptominer**
+(near-perfect entropy, maximum unique bytes), **rootkit** (normal-looking entropy but
+address-delta spikes simulating DKOM-style memory jumps).
 
 ```sh
-# Fedora / RHEL
-sudo dnf install make gcc go python3 libvmi-devel
-
-# Debian / Ubuntu
-sudo apt install make gcc golang python3 python3-venv libvmi-dev
+.venv/bin/python training/synthetic.py [--output data] [--normal 2000] [--malware 2000] [--seed 42]
 ```
 
-Your user must be in the `kvm` group to access guest memory:
+Output: `data/normal/` and `data/malware/`, each containing `n_sequences × 16` `.npy` files.
+
+---
+
+### `training/dataset.py`
+
+`MemoryPageDataset`: loads `.npy` files, slides window=16 stride=8 over sorted filenames
+per class, returns `(tensor(18,16), label_float)`.
+
+`stratified_split(dataset, 0.70/0.15/0.15)` → `(train, val, test)` Subsets.
+
+---
+
+### `training/train.py`
 
 ```sh
-sudo usermod -aG kvm $USER   # log out and back in after this
+.venv/bin/python training/train.py [--data-dir data] [--epochs 50] [--batch-size 32]
+                                    [--lr 1e-3] [--output-dir models] [--seed 42]
 ```
 
-LibVMI requires a guest configuration in `/etc/libvmi/libvmi.conf`:
+Auto-generates synthetic data if directories are empty. `BCEWithLogitsLoss`, Adam,
+`ReduceLROnPlateau(patience=5)`, grad clip norm=1.0, early stop patience=10.
+Saves best `models/tcn_weights.pt` + `models/config.json` on completion.
+
+**Must use `.venv/bin/python`** — system python3 does not have torch.
+
+---
+
+### `training/evaluate.py`
+
+```sh
+.venv/bin/python training/evaluate.py [--data-dir data] [--model-dir models]
+                                        [--n-latency 1000] [--batch-size 32] [--seed 42]
+```
+
+Outputs: Accuracy / Precision / Recall / F1 / ROC-AUC; `models/confusion_matrix.png`
+(requires matplotlib); latency benchmark with p50/p95/p99 percentiles.
+
+---
+
+## 4. Feature Vector (18 features)
+
+All features are `float32` in `[0, 1]`. Index is fixed.
+
+| # | Name | Formula | Malware detection relevance |
+|---|---|---|---|
+| 0 | `byte_entropy` | Shannon H / 8 | Packed/encrypted code → near 1.0 |
+| 1 | `nonzero_ratio` | count(b≠0) / 4096 | Zero-padded pages → low |
+| 2 | `printable_ratio` | count(0x20≤b≤0x7E) / 4096 | Binary code vs string data |
+| 3 | `high_byte_ratio` | count(b>0x7F) / 4096 | Encoded/obfuscated content |
+| 4 | `unique_bytes` | distinct byte values / 256 | Crypto buffers → near 1.0 |
+| 5 | `top4_freq` | sum(top-4 byte counts) / 4096 | NOP sleds / zero pages → high |
+| 6 | `zero_runs` | count(zero-runs>8) / 100 | Uninitialised pages → high |
+| 7 | `addr_norm` | phys_addr / 0xFFFFFFFFFFFF | Kernel vs userspace position |
+| 8 | `entropy_blocks_std` | std(H per 256B block) / 0.5 | Mixed page: header + payload |
+| 9 | `compression_ratio` | zlib(page,1) size / 4096 | Low=repetitive; high=packed/crypto |
+| 10 | `null_run_ratio` | bytes inside zero-runs>8 / 4096 | BSS / uninitialized → high |
+| 11 | `pe_header_score` | 0.0 / 0.5 / 1.0 MZ+PE sig | Injected PE / reflective DLL load |
+| 12 | `elf_header_score` | 0.0 / 0.5 / 1.0 \x7fELF | ELF mapped into guest memory |
+| 13 | `syscall_pattern_count` | count(SYSCALL\|INT80\|SYSENTER) / 100 | Shellcode syscall density |
+| 14 | `nop_sled_score` | bytes inside 0x90-runs>8 / 4096 | Classic NOP sled before shellcode |
+| 15 | `string_density` | count(printable runs≥4) / 100 | C2 URLs / config strings |
+| 16 | `entropy_delta` | (H[t]−H[t-1]+1)/2, clamped to [0,1] | Entropy spike/drop over time **(temporal)** |
+| 17 | `addr_delta` | (addr[t]−addr[t-1]) / 0xFFFFFFFFFFFF | Non-sequential jumps **(temporal)** |
+
+First frame: `entropy_delta = 0.5` (neutral), `addr_delta = 0.0`.
+
+---
+
+## 5. TCN Model Architecture
+
+**Input:** `(1, 18, 16)` — batch=1, features=18, sequence=16
+**Output:** sigmoid(logit) → score ∈ [0.0, 1.0]
+**Alert threshold:** 0.85 (from `config.json`)
+
+### `_CausalConv1d`
+
+`padding = (kernel-1) × dilation`. Forward slices `output[:, :, :-padding]` to remove
+future context. Strictly causal — valid for streaming inference.
+
+### `_TCNBlock`
 
 ```
-<vm_name> {
-    ostype = "Linux";
+x (in_ch, T)
+├─ residual: Identity if in_ch==out_ch, else Conv1d(in_ch, out_ch, 1)
+├─ weight_norm(CausalConv1d(in_ch→32, k=3, dilation=d)) → ReLU → Dropout(0.1)
+├─ weight_norm(CausalConv1d(32→32,    k=3, dilation=d)) → ReLU → Dropout(0.1)
+└─ ReLU(conv_out + residual) → (out_ch, T)
+```
+
+### Full stack
+
+```
+(1, 18, 16)
+  Block 0: _TCNBlock(18→32, dilation=1)   1×1 residual projection
+  Block 1: _TCNBlock(32→32, dilation=2)   identity residual
+  Block 2: _TCNBlock(32→32, dilation=4)   identity residual
+  AdaptiveAvgPool1d(1)  →  (1, 32, 1)
+  Flatten               →  (1, 32)
+  Linear(32→16) + ReLU
+  Linear(16→1)          →  raw logit
+  sigmoid               →  score ∈ [0, 1]
+```
+
+### Receptive field
+
+Each causal conv contributes `(3-1) × dilation` time steps:
+
+```
+Block 0: 2×1 + 2×1 =  4
+Block 1: 2×2 + 2×2 =  8
+Block 2: 2×4 + 2×4 = 16
+                   ─────
+Total RF = 1 + 28 = 29 time steps
+```
+
+RF (29) > sequence length (16): the last output timestep sees the entire input window.
+
+### `models/config.json` (current weights)
+
+```json
+{
+  "model_version": "1.0.0",
+  "feature_dim": 18,  "sequence_length": 16,
+  "filters": 32,  "num_blocks": 3,  "dilations": [1,2,4],  "kernel_size": 3,
+  "alert_threshold": 0.85,
+  "training_stats": {
+    "accuracy": 0.998336,  "f1_score": 0.998333,  "roc_auc": 1.0
+  },
+  "dataset_stats": { "normal_samples": 3999, "malware_samples": 3999 }
 }
 ```
 
-### 2. Build the Go binary
-
-```sh
-make
-# outputs bin/hyptcn
-# uses CGO_LDFLAGS="-lvmi"; requires libvmi-devel headers
-```
-
-### 3. Install Python dependencies
-
-```sh
-python3 -m venv .venv
-.venv/bin/pip install -r python/requirements.txt
-# installs torch>=2.0, numpy>=1.26
-```
-
-### 4. Run in mock mode (no KVM guest required)
-
-Start the analyzer first, then the scanner in a second terminal:
-
-```sh
-# Terminal 1 — analyzer
-.venv/bin/python python/analyzer.py
-
-# Terminal 2 — scanner (mock frames, 100 ms interval)
-./bin/hyptcn --mock --interval 100
-```
-
-### 5. Run against a real VM
-
-```sh
-# Terminal 1
-.venv/bin/python python/analyzer.py --socket /tmp/hyptcn.sock
-
-# Terminal 2
-./bin/hyptcn --vm myguest --address 0x1000000 --interval 500
-```
-
-`--vm` must match the domain name in `libvmi.conf` and the output of `virsh list`.
-`--address` is a guest physical address. Useful starting points: `0x1000` (first usable page), or addresses obtained from the host's `/proc/iomem` or a guest memory map.
+These metrics are on **synthetic test data only** and do not reflect real-world performance.
 
 ---
 
-## Usage Examples
+## 6. Training Pipeline
 
-### Mock mode — full end-to-end without a VM
+### Step 1 — Generate synthetic data (skipped automatically if data/ is populated)
 
 ```sh
-.venv/bin/python python/analyzer.py &
+.venv/bin/python training/synthetic.py --output data --normal 2000 --malware 2000
+# writes data/normal/ (32 000 files) and data/malware/ (32 000 files)
+```
+
+### Step 2 — Train
+
+```sh
+.venv/bin/python training/train.py \
+    --data-dir data --output-dir models \
+    --epochs 50 --batch-size 32 --lr 1e-3
+```
+
+Saves `models/tcn_weights.pt` on every validation improvement.
+Writes `models/config.json` with architecture + training stats when done.
+
+### Step 3 — Evaluate
+
+```sh
+.venv/bin/python training/evaluate.py --data-dir data --model-dir models --n-latency 1000
+```
+
+Outputs accuracy/F1/ROC-AUC table + inference latency benchmark.
+`models/confusion_matrix.png` if matplotlib is installed.
+
+### Verified output on synthetic data (2026-03-11)
+
+```
+Samples    : 1202 (601 normal, 601 malware)
+Accuracy   : 0.9967   Precision: 1.0000   Recall: 0.9933
+F1 Score   : 0.9967   ROC-AUC  : 1.0000
+Confusion Matrix:
+           Normal  Malware
+Normal   :    601        0
+Malware  :      4      597
+Latency  : mean 0.34 ms, p95 0.37 ms, p99 0.39 ms  (CPU, batch=1)
+```
+
+---
+
+## 7. Installation & Build
+
+### Prerequisites (Fedora)
+
+```sh
+sudo dnf install -y gcc make golang \
+    libvirt-devel json-c-devel glib2-devel \
+    cmake bison flex autoconf automake libtool pkg-config
+```
+
+### libvmi from source — REQUIRED
+
+The Fedora package (`dnf install libvmi`) is compiled **without KVM support** (Xen + file
+drivers only). You must build from source:
+
+```sh
+git clone https://github.com/libvmi/libvmi.git ~/libvmi-src
+cd ~/libvmi-src && mkdir build && cd build
+
+cmake .. \
+  -DENABLE_KVM=ON \
+  -DENABLE_KVM_LEGACY=ON \
+  -DENABLE_XEN=OFF \
+  -DENABLE_FILE=ON \
+  -DCMAKE_INSTALL_PREFIX=/usr/local
+
+make -j$(nproc)
+sudo make install
+sudo ldconfig
+```
+
+**Verify:**
+```sh
+strings /usr/local/lib64/libvmi.so | grep -i kvm
+# must print: VMI_KVM   VMI_INIT_DATA_KVMI_SOCKET
+```
+
+**Why `ENABLE_KVM_LEGACY=ON`?**
+The new KVM driver requires a KVMI socket (patched QEMU, not upstream). The legacy driver
+uses libvirt QMP `human-monitor-command xp` which works with stock QEMU.
+
+**Why `qemu:///session`?**
+Both KVM driver files hardcode `qemu:///system` upstream. The VM runs under the user's
+session daemon (`qemu:///session`), so both `kvm.c` and `kvm_legacy.c` were patched
+accordingly during the build.
+
+**No `/etc/libvmi.conf` needed.** `probe.c` calls `vmi_init` (not `vmi_init_complete`),
+skipping OS-layer init — only raw physical address reads are used.
+
+### Build hyptcn
+
+```sh
+make
+# → bin/hyptcn, linked via rpath to /usr/local/lib64/libvmi
+```
+
+The Makefile sets:
+```makefile
+LIBVMI_PREFIX     = /usr/local
+CGO_CFLAGS_EXTRA  = -I$(LIBVMI_PREFIX)/include
+CGO_LDFLAGS_EXTRA = -L$(LIBVMI_PREFIX)/lib64 -lvmi -Wl,-rpath,$(LIBVMI_PREFIX)/lib64
+```
+
+### Python venv
+
+```sh
+make deps
+# creates .venv/, installs torch>=2.0, numpy>=1.26, matplotlib>=3.7
+```
+
+**Always use `.venv/bin/python`** for the analyzer and all training scripts.
+System python3 does not have torch installed.
+
+---
+
+## 8. Usage Examples
+
+### Mock mode (no KVM required)
+
+```sh
+# Terminal 1
+cd python && ../.venv/bin/python analyzer.py --socket /tmp/hyptcn.sock
+
+# Terminal 2
 ./bin/hyptcn --mock --interval 100
 ```
 
-**Analyzer stdout — warm-up phase (frames 1–15):**
+Go stderr output:
+```
+time=2026-03-11T22:26:07.701+01:00 level=INFO msg="starting scan" socket=/tmp/hyptcn.sock vm=guest address=4096 interval=150ms mock=true
+time=2026-03-11T22:26:07.705+01:00 level=INFO msg="analysis complete" score=0 status=warming_up
+...  (15 warming_up frames)
+time=2026-03-11T22:26:09.962+01:00 level=INFO msg="analysis complete" score=1 status=ok
+```
 
+Analyzer stdout:
 ```json
 {"status": "warming_up", "frames": 1}
-{"status": "warming_up", "frames": 2}
-{"status": "warming_up", "frames": 3}
 ...
 {"status": "warming_up", "frames": 15}
+{"timestamp": 1773264369956, "addr": "0x10000", "score": 1.0, "alert": true, "status": "ok"}
 ```
 
-**Analyzer stdout — live scores (frame 16 onward):**
+Note: mock mode scores are 1.0 because `crypto/rand` pages are maximum-entropy — the
+synthetic-trained model correctly classifies them as malware-like (cryptominer / shellcode
+archetype).
 
+### Live VM introspection
+
+```sh
+virsh domstate hyptcn-guest       # must be: running
+
+# Terminal 1
+cd python && ../.venv/bin/python analyzer.py \
+    --socket /tmp/hyptcn.sock \
+    --log-dir /tmp/live_frames/ \
+    --label normal
+
+# Terminal 2
+./bin/hyptcn --vm hyptcn-guest --address 0x1000000 --interval 500
+```
+
+Verified live output (2026-03-11, 24 frames):
+```
+time=2026-03-11T22:26:19.622+01:00 level=INFO msg="starting scan" vm=hyptcn-guest address=16777216 interval=500ms mock=false
+time=...  level=INFO msg="analysis complete" score=0 status=warming_up   (×15)
+time=...  level=INFO msg="analysis complete" score=0 status=ok           (×9)
+time=2026-03-11T22:26:31.618+01:00 level=INFO msg="stopping scan loop"
+```
+
+Analyzer stdout:
 ```json
-{"timestamp": 1772759581713, "addr": "0x10000", "score": 0.496012, "alert": false}
-{"timestamp": 1772759581804, "addr": "0x11000", "score": 0.496010, "alert": false}
-{"timestamp": 1772759581903, "addr": "0x12000", "score": 0.496006, "alert": false}
+{"status": "warming_up", "frames": 1}
+...
+{"timestamp": 1773264387155, "addr": "0x1000000", "score": 0.0, "alert": false, "status": "ok"}
 ```
 
-**Go scanner stderr (structured slog output):**
+Score is 0.0 on a real idle VM because the kernel pages at `0x1000000` match the normal
+synthetic archetype (low entropy, null-heavy). The model has never seen real malware.
 
+### With --log-dir for data collection
+
+```sh
+cd python && ../.venv/bin/python analyzer.py \
+    --socket /tmp/hyptcn.sock \
+    --log-dir data/ \
+    --label normal
+# frames saved to data/normal/<timestamp_ms>_<addr_hex>.npy
 ```
-time=2026-03-06T02:01:38.258+01:00 level=INFO msg="starting scan" socket=/tmp/hyptcn.sock vm=guest address=4096 interval=100ms mock=true
-time=2026-03-06T02:01:38.260+01:00 level=INFO msg="analysis complete" score=0 status=warming_up
-time=2026-03-06T02:01:39.814+01:00 level=INFO msg="analysis complete" score=0.498 status=
+
+### `make python-service`
+
+```sh
+make python-service
+# equivalent to: cd python && .venv/bin/python analyzer.py
+#                --socket /tmp/hyptcn.sock --log-dir /tmp/hyptcn-frames/
 ```
 
 ### Custom socket path
 
 ```sh
-.venv/bin/python python/analyzer.py --socket /run/hyptcn/analyzer.sock
-./bin/hyptcn --mock --socket /run/hyptcn/analyzer.sock --interval 250
-```
-
-### UDS connection retry (analyzer not yet up)
-
-If the analyzer is slow to start, the Go binary retries silently:
-
-```
-level=WARN msg="analyzer socket unavailable, retrying" attempt=1 of=3
-level=WARN msg="analyzer socket unavailable, retrying" attempt=2 of=3
-level=ERROR msg="streaming aborted" err="failed to dial analyzer socket \"/tmp/hyptcn.sock\" after 3 attempts: ..."
+./bin/hyptcn --socket /run/user/1000/hyptcn.sock --vm hyptcn-guest --address 0x2000000
+cd python && ../.venv/bin/python analyzer.py --socket /run/user/1000/hyptcn.sock
 ```
 
 ---
 
-## Current Status
+## 9. Dataset Collection
 
-The following works end-to-end today in mock mode:
+### Collecting normal traffic
 
-- **Mock frame generation.** `--mock` fills 4096-byte pages with `crypto/rand` bytes at sequential physical addresses (`0x1000`, `0x2000`, …) at the configured millisecond interval.
-- **All 18 features.** `python/model/features.py` `extract()` computes all 18 features correctly; every value stays in `[0.0, 1.0]` across random, zero-filled, text, ELF, and PE page types.
-- **TCN inference.** `TCNAnomalyDetector` forward pass runs correctly on `(1, 18, 16)` input; `infer()` returns a valid float.
-- **Sliding window.** `analyzer.py` correctly emits `warming_up` for frames 1–15 and live scores from frame 16 onward.
-- **Alert threshold.** `score > 0.85` sets `"alert": true`; with random weights scores cluster near 0.496, so no false alerts fire in mock mode.
-- **UDS retry.** Go binary retries the socket connection 3× with 1s delays before exiting.
-- **Build.** `make` compiles the CGO Go binary against libvmi without errors on Fedora with `libvmi-devel` installed.
+```sh
+# Start analyzer logging to data/normal/
+cd python && ../.venv/bin/python analyzer.py \
+    --socket /tmp/hyptcn.sock --log-dir data/ --label normal &
 
-**Model weights are randomly initialized.** There is no training data and no trained model. All scores (~0.496) reflect random network weights applied to random page data, not meaningful anomaly detection. The architecture is correct and ready to train; it needs labeled memory captures.
+# Run scanner for hours while guest does normal work
+./bin/hyptcn --vm hyptcn-guest --address 0x1000000 --interval 100
+```
+
+### Collecting malware traffic
+
+Boot a **disposable snapshot** of the guest, inject the malware sample, then:
+
+```sh
+cd python && ../.venv/bin/python analyzer.py \
+    --socket /tmp/hyptcn.sock --log-dir data/ --label malware &
+
+./bin/hyptcn --vm hyptcn-guest --address 0x1000000 --interval 100
+```
+
+### Directory layout
+
+```
+data/
+├── normal/
+│   ├── 1741699200000_0000000001000000.npy
+│   └── ...
+└── malware/
+    ├── 1741699300000_0000000001000000.npy
+    └── ...
+```
+
+Each `.npy` contains: `{features:(18,) float32, addr:int, timestamp_ms:int, raw_page:(4096,) uint8}`.
+
+### Retrain on real data
+
+```sh
+.venv/bin/python training/train.py --data-dir data --output-dir models --epochs 50
+.venv/bin/python training/evaluate.py --data-dir data --model-dir models
+# restart analyzer — it reloads models/tcn_weights.pt at startup
+```
 
 ---
 
-## Roadmap
+## 10. Current Status
 
-### Infrastructure TODO
+### What works (verified 2026-03-11)
 
-- [ ] Add `--vm` flag integration with real LibVMI (remove mock requirement for live VM scanning)
-- [x] Add `entropy_delta` and `addr_delta` temporal features (T vs T−1 comparison across consecutive frames)
-- [x] Persistent frame logging to `.npy` files for dataset collection (`--log-dir` flag in `python/analyzer.py`)
-- [ ] Training script (`train.py`) with 70/15/15 split, Adam optimizer, early stopping on validation loss
-- [ ] Model evaluation script: confusion matrix, ROC-AUC, F1 score, per-frame latency benchmarks
-- [ ] REST API or gRPC endpoint for score streaming instead of stdout JSON
+- [x] **Live VM introspection** — 24 frames captured from `hyptcn-guest` at `0x1000000`,
+      stable 500ms cadence, zero dropped frames
+- [x] **Full pipeline** — Go scanner → UDS → Python analyzer → TCN → JSON response
+- [x] **Frame logging** — `.npy` files written during live session
+- [x] **Mock mode** — fully functional for pipeline testing without a VM
+- [x] **Training pipeline** — synthetic data, train, evaluate all work end-to-end
+- [x] **Model loaded** — `models/tcn_weights.pt` exists; synthetic accuracy 99.8%, ROC-AUC 1.0
+- [x] **libvmi KVM** — rebuilt from source with `ENABLE_KVM_LEGACY=ON`, `qemu:///session` patch
+- [x] **Inference latency** — 0.34 ms mean (CPU, batch=1)
 
-### Research TODO (thesis work)
+### What does not work yet
 
-- [ ] Collect normal behavior dataset: idle VM, web browsing, compilation workloads
-- [ ] Collect malware dataset: Metasploit meterpreter, XMRig cryptominer, Diamorphine rootkit, ransomware-simulator
-- [ ] Label frames by ground-truth process and build training pipeline
-- [ ] Tune TCN hyperparameters: dilation depth, kernel size, filter count via grid search or Optuna
-- [ ] Evaluate semantic gap solutions for process-level features (EPROCESS linked-list walking, symbol offsets from `rekall`/`volatility` profiles)
-- [ ] Compare TCN vs LSTM/GRU baseline on the same dataset
-- [ ] Write thesis chapters: virtualization theory, VMI principles, TCN theory, implementation, evaluation
+- [ ] **Real malware dataset** — none collected; model trained on synthetic data only
+- [ ] **Live score meaning** — score=0.0 on idle Debian 12 VM; model needs real labeled data
+- [ ] **Smoke tests** — no `make test`, no unit tests for features/wire protocol/training
+- [ ] **Semantic gap** — raw PA only; no mapping of physical pages to processes or VA
+- [ ] **Address sweep** — scanner samples one fixed address per run, not a range
 
 ---
 
-## What Still Needs To Be Done
+## 11. Roadmap
 
-Honest accounting of everything not yet implemented:
+### Infrastructure
 
-- **Real LibVMI connection to a live VM.** The C extractor and CGO bridge compile and link correctly, but the end-to-end path from `vmi_read_pa` through to the Python analyzer has only been tested in mock mode. A real KVM guest with a matching `libvmi.conf` entry is required to validate it.
-- **Trained model weights.** `models/tcn_weights.pt` does not exist. The model produces scores near 0.496 for all inputs because weights are random. The model will not detect anything meaningful until trained on labeled normal/malicious memory traces.
-- **Dataset collection infrastructure.** `python/analyzer.py --log-dir <path> --label <name>` saves frames as `.npy` files. Both normal and malicious memory captures still need to be collected and labeled before training can begin.
-- **Training and evaluation pipeline.** No `train.py`, no `eval.py`, no loss curves, no ROC-AUC measurement.
-- **Process-level features via semantic gap.** The system operates at the physical page level with no knowledge of which guest process owns a given page. Detecting hidden processes (Diamorphine-style DKOM) requires parsing guest kernel data structures — `task_struct` linked lists on Linux, EPROCESS chains on Windows — a significant VMI engineering task involving OS version-specific symbol offsets.
-- **Performance benchmarking under real hypervisor load.** No measurements exist for feature extraction latency, TCN inference time, or the overhead imposed on the guest by continuous `vmi_read_pa` calls.
-- **Any form of alerting beyond stdout JSON.** There is no webhook, no syslog output, no email, and no integration with SIEM systems. The `"alert": true` field in the JSON is the entire alerting mechanism at this stage.
+- [x] 18-feature extractor with entropy_delta + addr_delta temporal features
+- [x] `--log-dir` / `--label` frame logger for dataset collection
+- [x] Training pipeline: synthetic.py, dataset.py, train.py, evaluate.py
+- [x] Live KVM introspection via libvmi legacy driver + qemu:///session patch
+- [ ] Smoke tests (`make test`): mock-mode end-to-end, feature extractor unit tests
+- [ ] Address sweep mode: scan a configurable PA range per tick
+- [ ] `confusion_matrix.png` — install matplotlib in venv (`pip install matplotlib`)
+- [ ] Systemd unit files for both services
+
+### Research (thesis work)
+
+- [ ] Real malware dataset collection on live guests
+- [ ] Retrain model on real data — synthetic ROC-AUC=1.0 is not informative
+- [ ] Semantic gap: correlate PA → VA → PID via CR3 + page-table walking
+- [ ] Process-level features: which PID owns an anomalous physical page
+- [ ] Evaluate on real APT samples: Cobalt Strike beacon, reflective DLL injection,
+      process hollowing, Diamorphine rootkit
+- [ ] Compare TCN vs LSTM / attention baseline on the same feature set
+- [ ] SIEM integration: structured alerts to syslog / Kafka / Elastic
+- [ ] Multi-guest monitoring: fan out to N VMs from one analyzer
+
+---
+
+## 12. What Still Needs To Be Done
+
+**No real malware dataset.** Every `.npy` in `data/` was produced by `synthetic.py` using
+hand-crafted statistical distributions. The `accuracy=0.998` in `config.json` is a test-set
+score on held-out synthetic data from the same generator. It measures nothing about
+real-world detection.
+
+**Score = 0.0 on live VM.** Idle Debian 12 kernel pages at `0x1000000` are low-entropy
+and null-heavy — they match the normal synthetic archetype, so the model outputs 0.0.
+Score = 1.0 in mock mode is the opposite effect: `crypto/rand` pages are maximum-entropy,
+matching the cryptominer/shellcode archetypes. Both are expected; neither indicates that the
+model would detect a real threat.
+
+**No smoke tests.** There is no `make test`. The feature extractor, wire protocol, and
+training pipeline have no automated tests. A regression would be silent.
+
+**Semantic gap not solved.** `vmi_read_pa` returns raw bytes from a physical address.
+The system cannot tell which process owns the page, nor which virtual address it maps to.
+Closing the semantic gap requires OS-offset-aware page-table walking — for Linux this means
+`task_struct` traversal using `vmi_init_complete` with a System.map or rekall profile,
+which was intentionally bypassed to avoid the config dependency.
+
+**Single fixed address.** The scanner samples one PA per run. A meaningful scan must sweep
+a physical address range or focus on known-suspicious regions (guest heap, kernel code
+sections of specific PIDs).
+
+**`confusion_matrix.png` not generated.** matplotlib is not installed in the venv. Run
+`pip install matplotlib` inside `.venv` or `make deps` after adding it to
+`python/requirements.txt`.
