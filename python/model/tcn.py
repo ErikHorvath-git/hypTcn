@@ -12,12 +12,15 @@ Architecture per spec:
     Dense(32 → 16, ReLU)
     Dense(16 → 1, Sigmoid)
 
-Weights are loaded from models/tcn_weights.pt when the file exists;
-random init is used otherwise (no pre-training required).
+Weights are loaded from models/tcn_weights.pt when the file exists.
+Hyperparameters are read from models/config.json when available; this ensures
+the inference model always matches the trained architecture exactly.
+Random init is used when neither file exists.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from typing import TYPE_CHECKING
 
@@ -29,7 +32,7 @@ from torch.nn.utils import weight_norm
 if TYPE_CHECKING:
     import numpy as np
 
-# ── Hyperparameters ────────────────────────────────────────────────────────────
+# ── Hyperparameter defaults ────────────────────────────────────────────────────
 FEATURE_DIM = 18
 SEQUENCE_LENGTH = 16
 KERNEL_SIZE = 3
@@ -37,11 +40,22 @@ NUM_BLOCKS = 3
 FILTERS = 32
 DROPOUT = 0.1
 
-# Resolve to <repo>/models/tcn_weights.pt regardless of CWD
-WEIGHTS_PATH = os.path.join(
+# Resolve to <repo>/models/ regardless of CWD
+_MODELS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "models", "tcn_weights.pt",
+    "models",
 )
+WEIGHTS_PATH = os.path.join(_MODELS_DIR, "tcn_weights.pt")
+CONFIG_PATH = os.path.join(_MODELS_DIR, "config.json")
+
+
+def _load_config(config_path: str = CONFIG_PATH) -> dict | None:
+    """Load models/config.json; return None if absent or unreadable."""
+    try:
+        with open(config_path) as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
 
 
 # ── Building blocks ────────────────────────────────────────────────────────────
@@ -117,11 +131,14 @@ class TCNAnomalyDetector(nn.Module):
             nn.Linear(filters, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
-            nn.Sigmoid(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, features, sequence) → (batch,) scores in [0, 1]."""
+        """x: (batch, features, sequence) → (batch,) raw logits.
+
+        Use torch.sigmoid(model(x)) for probabilities, or BCEWithLogitsLoss
+        during training for numerical stability.
+        """
         x = self.tcn(x)
         x = self.pool(x)
         return self.head(x).squeeze(-1)
@@ -130,13 +147,37 @@ class TCNAnomalyDetector(nn.Module):
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def load_model(weights_path: str = WEIGHTS_PATH) -> TCNAnomalyDetector:
-    """Return an eval-mode detector, loading weights from disk when available."""
-    model = TCNAnomalyDetector()
+    """Return an eval-mode detector.
+
+    Construction order:
+    1. If models/config.json exists, use its hyperparameters to build the model
+       so the architecture exactly matches what was trained.
+    2. Load weights from weights_path if the file exists.
+    3. Fall back to default hyperparameters + random init if neither file exists.
+    """
+    config = _load_config()
+    if config:
+        model = TCNAnomalyDetector(
+            feature_dim=config.get("feature_dim", FEATURE_DIM),
+            filters=config.get("filters", FILTERS),
+            kernel_size=config.get("kernel_size", KERNEL_SIZE),
+            num_blocks=config.get("num_blocks", NUM_BLOCKS),
+        )
+    else:
+        model = TCNAnomalyDetector()
+
     if os.path.isfile(weights_path):
         state = torch.load(weights_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state)
+
     model.eval()
     return model
+
+
+def save_model(model: TCNAnomalyDetector, weights_path: str = WEIGHTS_PATH) -> None:
+    """Save model state dict to weights_path, creating parent directories as needed."""
+    os.makedirs(os.path.dirname(os.path.abspath(weights_path)), exist_ok=True)
+    torch.save(model.state_dict(), weights_path)
 
 
 def infer(model: TCNAnomalyDetector, window: "np.ndarray") -> float:
@@ -154,5 +195,6 @@ def infer(model: TCNAnomalyDetector, window: "np.ndarray") -> float:
         window = window.T  # → (FEATURE_DIM, SEQUENCE_LENGTH)
     tensor = torch.from_numpy(window).unsqueeze(0).float()  # (1, 18, 16)
     with torch.no_grad():
-        score = model(tensor)
+        logit = model(tensor)
+        score = torch.sigmoid(logit)
     return float(score.squeeze().item())
