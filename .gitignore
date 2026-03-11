@@ -5,6 +5,9 @@ CLAUDE.md
 /bin
 /bin/hyptcn
 
+# CGO compiled objects (architecture-specific, rebuilt automatically)
+*.o
+
 # CGO cache
 .cache/
 
