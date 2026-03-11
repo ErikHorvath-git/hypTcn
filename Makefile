@@ -23,7 +23,7 @@ $(VENV)/bin/activate: $(REQUIREMENTS)
 	$(PIP) install -r $(REQUIREMENTS)
 
 python-service: deps
-	$(VENV)/bin/python python/analyzer.py --socket /tmp/hyptcn.sock
+	cd python && ../$(VENV)/bin/python analyzer.py --socket /tmp/hyptcn.sock
 
 clean:
 	rm -rf bin
