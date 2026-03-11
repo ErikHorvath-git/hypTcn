@@ -37,6 +37,7 @@ type Engine struct {
 	logger       *slog.Logger
 	conn         net.Conn
 	reader       *bufio.Reader
+	vmiHandle    *extractor.Handle
 }
 
 // NewEngine builds a reusable Engine bound to a Unix domain socket.
@@ -72,11 +73,11 @@ func (e *Engine) Analyze(ctx context.Context, address uint64, payload []byte) (*
 	var header [8]byte
 	binary.LittleEndian.PutUint64(header[:], address)
 	if err := writeAll(e.conn, header[:]); err != nil {
-		_ = e.Close()
+		_ = e.closeConn()
 		return nil, fmt.Errorf("failed to write header: %w", err)
 	}
 	if err := writeAll(e.conn, payload); err != nil {
-		_ = e.Close()
+		_ = e.closeConn()
 		return nil, fmt.Errorf("failed to write payload: %w", err)
 	}
 
@@ -86,7 +87,7 @@ func (e *Engine) Analyze(ctx context.Context, address uint64, payload []byte) (*
 
 	line, err := e.reader.ReadBytes('\n')
 	if err != nil {
-		_ = e.Close()
+		_ = e.closeConn()
 		return nil, fmt.Errorf("failed to read analyzer response: %w", err)
 	}
 
@@ -99,11 +100,21 @@ func (e *Engine) Analyze(ctx context.Context, address uint64, payload []byte) (*
 	return &pred, nil
 }
 
-// Stream continuously captures pages from the guest and forwards them to the analyzer.
+// Stream opens the VMI handle (non-mock mode), continuously captures pages, and
+// forwards them to the analyzer. Closes both VMI handle and UDS connection on return.
 func (e *Engine) Stream(ctx context.Context, physicalAddress uint64, interval time.Duration) error {
 	if interval <= 0 {
 		interval = defaultSampleInterval
 	}
+
+	if !e.mock {
+		h, err := extractor.Open(e.vmName)
+		if err != nil {
+			return fmt.Errorf("open vmi: %w", err)
+		}
+		e.vmiHandle = h
+	}
+
 	defer e.Close()
 
 	if err := e.captureAndAnalyze(ctx, physicalAddress); err != nil {
@@ -139,9 +150,9 @@ func (e *Engine) captureAndAnalyze(ctx context.Context, physicalAddress uint64) 
 	} else {
 		addr = physicalAddress
 		var err error
-		payload, err = extractor.ExtractPage(e.vmName, physicalAddress)
+		payload, err = e.vmiHandle.ReadPage(physicalAddress)
 		if err != nil {
-			return fmt.Errorf("extract page: %w", err)
+			return fmt.Errorf("read page: %w", err)
 		}
 	}
 
@@ -183,8 +194,16 @@ func (e *Engine) connect(ctx context.Context) error {
 	return fmt.Errorf("failed to dial analyzer socket %q after %d attempts: %w", e.socketPath, maxConnAttempts, lastErr)
 }
 
-// Close tears down the persistent analyzer socket connection.
+// Close tears down the VMI handle and the persistent analyzer socket connection.
 func (e *Engine) Close() error {
+	if e.vmiHandle != nil {
+		e.vmiHandle.Close()
+		e.vmiHandle = nil
+	}
+	return e.closeConn()
+}
+
+func (e *Engine) closeConn() error {
 	if e.conn == nil {
 		return nil
 	}
