@@ -5,15 +5,22 @@ CC=gcc
 PYTHON=python3
 VENV=.venv
 PIP=$(VENV)/bin/pip
-UVICORN=$(VENV)/bin/uvicorn
 GOCACHE=$(CURDIR)/.cache/go-build
-REQUIREMENTS=analyzer_service/requirements.txt
+GOPATH=$(CURDIR)/.cache/go-path
+REQUIREMENTS=python/requirements.txt
+
+# libvmi built from source with KVM support installed to /usr/local
+LIBVMI_PREFIX=/usr/local
+CGO_CFLAGS_EXTRA=-I$(LIBVMI_PREFIX)/include
+CGO_LDFLAGS_EXTRA=-L$(LIBVMI_PREFIX)/lib64 -lvmi -Wl,-rpath,$(LIBVMI_PREFIX)/lib64
 
 all: bin/hyptcn
 
 bin/hyptcn:
 	@mkdir -p bin
-	GOCACHE=$(GOCACHE) $(GO) build -o $@ ./cmd/hyptcn
+	CGO_CFLAGS="$(CGO_CFLAGS_EXTRA)" CGO_LDFLAGS="$(CGO_LDFLAGS_EXTRA)" \
+	GOCACHE=$(GOCACHE) GOPATH=$(GOPATH) \
+	$(GO) build -o $@ ./cmd/hyptcn
 
 deps: $(VENV)/bin/activate
 
@@ -23,7 +30,7 @@ $(VENV)/bin/activate: $(REQUIREMENTS)
 	$(PIP) install -r $(REQUIREMENTS)
 
 python-service: deps
-	$(UVICORN) analyzer_service.server:APP --uds /tmp/hyptcn.sock --log-level info
+	cd python && ../$(VENV)/bin/python analyzer.py --socket /tmp/hyptcn.sock --log-dir /tmp/hyptcn-frames/
 
 clean:
 	rm -rf bin

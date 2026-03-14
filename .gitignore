@@ -1,7 +1,12 @@
+CLAUDE.md
+
 # Build artifacts
 /bin/
 /bin
 /bin/hyptcn
+
+# CGO compiled objects (architecture-specific, rebuilt automatically)
+*.o
 
 # CGO cache
 .cache/
@@ -24,3 +29,7 @@ venv/
 # Bytecode
 __pycache__/
 *.pyc
+
+
+#claude conf
+.claude

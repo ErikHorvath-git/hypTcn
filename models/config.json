@@ -1,0 +1,32 @@
+{
+  "model_version": "1.0.0",
+  "trained_at": "2026-03-11T21:26:47.768226+00:00",
+  "feature_dim": 18,
+  "sequence_length": 16,
+  "filters": 32,
+  "num_blocks": 3,
+  "dilations": [
+    1,
+    2,
+    4
+  ],
+  "kernel_size": 3,
+  "alert_threshold": 0.85,
+  "training_stats": {
+    "epochs": 3,
+    "final_train_loss": 0.006535,
+    "final_val_loss": 0.000851,
+    "best_val_loss": 0.000851,
+    "accuracy": 0.998336,
+    "f1_score": 0.998333,
+    "roc_auc": 1.0
+  },
+  "dataset_stats": {
+    "normal_samples": 3999,
+    "malware_samples": 3999,
+    "train_split": 0.7,
+    "val_split": 0.15,
+    "test_split": 0.15
+  },
+  "weights_path": "models/tcn_weights.pt"
+}

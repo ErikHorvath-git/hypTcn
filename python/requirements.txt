@@ -1,0 +1,4 @@
+torch>=2.0
+numpy>=1.26
+matplotlib>=3.7
+# asyncio is part of the Python standard library — no install needed
