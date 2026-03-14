@@ -1,13 +1,13 @@
 """Per-page feature extraction for the hypTcn TCN pipeline.
 
-Produces an 18-element float32 vector from a 4096-byte raw memory page
-and its physical address:
+Produces a 20-element float32 vector from a 4096-byte raw memory page,
+its physical address, and OS-layer telemetry passed in from the Go engine:
 
-    Original 8:
+    Original 8  (indices 0–7):
         byte_entropy, nonzero_ratio, printable_ratio, high_byte_ratio,
         unique_bytes, top4_freq, zero_runs, addr_norm
 
-    Structural 8:
+    Structural 8  (indices 8–15):
         entropy_blocks_std  — std-dev of per-256B-block entropies (normalized)
         compression_ratio   — zlib compressed size / 4096
         null_run_ratio      — fraction of bytes inside zero-runs > 8 bytes
@@ -17,9 +17,14 @@ and its physical address:
         nop_sled_score      — fraction of bytes inside 0x90-runs > 8 bytes
         string_density      — count of printable-ASCII strings ≥ 4 bytes / 100
 
-    Temporal 2 (require prev_features from previous frame):
+    Temporal 2  (indices 16–17):
         entropy_delta — byte_entropy change T→T-1, shifted to [0,1]
         addr_delta    — physical address jump T→T-1, clamped to [0,1]
+
+    OS-layer 2  (indices 18–19):
+        kernel_module_count — loaded kernel modules / 200 (normalised)
+        network_conn_count  — active TCP connections / 100 (normalised)
+        (both are 0.0 in raw / mock mode where the OS layer is unavailable)
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ import zlib
 import numpy as np
 
 PAGE_SIZE = 4096
-FEATURE_DIM = 18
+FEATURE_DIM = 20
 _ADDR_MAX = float(0xFFFFFFFFFFFF)  # 48-bit physical address space
 _N_BLOCKS = 16
 _BLOCK_SIZE = PAGE_SIZE // _N_BLOCKS  # 256 bytes per block
@@ -39,18 +44,24 @@ def extract(
     page: bytes,
     address: int,
     prev_features: np.ndarray | None = None,
+    kernel_module_count_norm: float = 0.0,
+    network_conn_count_norm: float = 0.0,
 ) -> np.ndarray:
-    """Return shape-(18,) float32 feature vector for one page.
+    """Return shape-(20,) float32 feature vector for one page.
 
     Args:
-        page:          Exactly 4096 raw bytes from the guest's physical memory.
-        address:       Physical address the page was read from.
-        prev_features: Feature vector from the immediately preceding frame
-                       (shape (18,) or (16,)), or None for the first frame.
-                       Used to compute entropy_delta and addr_delta.
+        page:                    Exactly 4096 raw bytes from the guest's physical memory.
+        address:                 Physical address the page was read from.
+        prev_features:           Feature vector from the immediately preceding frame
+                                 (shape (20,) or compatible), or None for the first frame.
+                                 Used to compute entropy_delta and addr_delta.
+        kernel_module_count_norm: Loaded kernel module count / 200, from the Go engine.
+                                 0.0 when OS layer is unavailable (raw / mock mode).
+        network_conn_count_norm:  Active TCP connection count / 100, from the Go engine.
+                                 0.0 when OS layer is unavailable (raw / mock mode).
 
     Returns:
-        numpy array of shape (18,), dtype float32, all values in [0, 1].
+        numpy array of shape (20,), dtype float32, all values in [0, 1].
     """
     if len(page) != PAGE_SIZE:
         raise ValueError(f"expected {PAGE_SIZE}-byte page, got {len(page)}")
@@ -60,88 +71,77 @@ def extract(
 
     # ── original 8 features ───────────────────────────────────────────────────
 
-    # Shannon entropy normalized to [0, 1]  (max = log2(256) = 8 bits)
     nz_probs = counts[counts > 0] / PAGE_SIZE
     byte_entropy = float(-np.dot(nz_probs, np.log2(nz_probs)) / 8.0)
 
-    # Ratio of non-zero bytes
     nonzero_ratio = float(np.count_nonzero(arr)) / PAGE_SIZE
 
-    # Ratio of printable ASCII bytes (0x20–0x7E)
     printable_ratio = float(np.sum((arr >= 0x20) & (arr <= 0x7E))) / PAGE_SIZE
 
-    # Ratio of high bytes (> 0x7F)
     high_byte_ratio = float(np.sum(arr > 0x7F)) / PAGE_SIZE
 
-    # Unique byte values / 256
     unique_bytes = float(np.count_nonzero(counts)) / 256.0
 
-    # Combined frequency of the 4 most common byte values
     top4_freq = float(np.partition(counts, -4)[-4:].sum()) / PAGE_SIZE
 
-    # Count of zero-byte runs > 8 bytes long, normalized by 100
     zero_runs = float(_count_zero_runs(arr, min_run=8)) / 100.0
 
-    # Physical address normalized to [0, 1]
     addr_norm = min(float(address) / _ADDR_MAX, 1.0) if _ADDR_MAX > 0 else 0.0
 
-    # ── new 8 features ────────────────────────────────────────────────────────
+    # ── structural 8 features ─────────────────────────────────────────────────
 
-    # Std-dev of per-256B-block Shannon entropies; max possible std ≈ 0.5
     block_entropies = np.array([
         _block_entropy(arr[i * _BLOCK_SIZE:(i + 1) * _BLOCK_SIZE])
         for i in range(_N_BLOCKS)
     ])
     entropy_blocks_std = min(float(np.std(block_entropies)) / 0.5, 1.0)
 
-    # zlib compressed size / PAGE_SIZE  (low = repetitive, high = random)
     compression_ratio = min(float(len(zlib.compress(page, level=1))) / PAGE_SIZE, 1.0)
 
-    # Fraction of bytes that fall inside zero-runs > 8 bytes
     null_run_ratio = float(_bytes_in_runs(arr, value=0, min_run=8)) / PAGE_SIZE
 
-    # PE executable header strength: 0.0 / 0.5 / 1.0
     pe_header_score = _pe_header_score(page)
 
-    # ELF executable header strength: 0.0 / 0.5 / 1.0
     elf_header_score = _elf_header_score(page)
 
-    # x86 syscall-family opcode pairs per page, normalized by 100
     syscall_pattern_count = min(float(_syscall_pattern_count(arr)) / 100.0, 1.0)
 
-    # Fraction of bytes inside 0x90 (NOP) runs > 8 bytes
     nop_sled_score = float(_bytes_in_runs(arr, value=0x90, min_run=8)) / PAGE_SIZE
 
-    # Count of printable-ASCII strings ≥ 4 bytes, normalized by 100
     string_density = min(float(_count_strings(arr, min_len=4)) / 100.0, 1.0)
 
     # ── temporal 2 features (require previous frame) ──────────────────────────
 
     if prev_features is None:
-        # First frame: neutral mid-point for delta, zero for address jump
         entropy_delta = 0.5
         addr_delta = 0.0
     else:
-        # byte_entropy is always index 0 regardless of vector length
         prev_entropy = float(prev_features[0])
-        raw_delta = byte_entropy - prev_entropy          # in [-1.0, 1.0]
+        raw_delta = byte_entropy - prev_entropy
         clamped = max(-1.0, min(1.0, raw_delta))
-        entropy_delta = (clamped + 1.0) / 2.0           # shift to [0.0, 1.0]
+        entropy_delta = (clamped + 1.0) / 2.0
 
-        # addr_norm is index 7; reconstruct absolute address from it for delta
         prev_addr = float(prev_features[7]) * _ADDR_MAX
         raw_addr_delta = (float(address) - prev_addr) / _ADDR_MAX
         addr_delta = max(0.0, min(1.0, raw_addr_delta))
+
+    # ── OS-layer 2 features ───────────────────────────────────────────────────
+    # Clamp to [0, 1] in case the caller passes un-normalised values.
+    mod_count_norm  = max(0.0, min(1.0, float(kernel_module_count_norm)))
+    conn_count_norm = max(0.0, min(1.0, float(network_conn_count_norm)))
 
     return np.array(
         [byte_entropy, nonzero_ratio, printable_ratio, high_byte_ratio,
          unique_bytes, top4_freq, zero_runs, addr_norm,
          entropy_blocks_std, compression_ratio, null_run_ratio, pe_header_score,
          elf_header_score, syscall_pattern_count, nop_sled_score, string_density,
-         entropy_delta, addr_delta],
+         entropy_delta, addr_delta,
+         mod_count_norm, conn_count_norm],
         dtype=np.float32,
     )
 
+
+# ── helpers ────────────────────────────────────────────────────────────────────
 
 def _run_boundaries(arr: np.ndarray, value: int):
     """Return (starts, ends) index arrays for runs of `value` in `arr`."""
@@ -189,7 +189,7 @@ def _elf_header_score(page: bytes) -> float:
     """0.0 = no ELF magic, 0.5 = magic but bad class, 1.0 = valid ELF header."""
     if len(page) < 18 or page[0:4] != b"\x7fELF":
         return 0.0
-    return 1.0 if page[4] in (1, 2) else 0.5  # EI_CLASS: 1=32-bit, 2=64-bit
+    return 1.0 if page[4] in (1, 2) else 0.5
 
 
 def _syscall_pattern_count(arr: np.ndarray) -> int:

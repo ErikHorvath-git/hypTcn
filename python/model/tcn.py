@@ -1,21 +1,29 @@
-"""Standalone TCN anomaly-detection model for the hypTcn pipeline.
+"""Standalone TCN anomaly-detection and activity-classification model.
 
-Input:  (batch, features=18, sequence=16)  — one sliding window of pages
-Output: float in [0.0, 1.0]               — anomaly score (sigmoid)
+Input:  (batch, features=20, sequence=16)  — one sliding window of pages
+Output: two heads computed from a shared backbone
 
-Architecture per spec:
+    anomaly_logit  — (batch,) raw logit; sigmoid → score in [0,1]
+    class_logits   — (batch, 5) raw logits; argmax → activity class
+
+Activity classes:
+    0 = normal
+    1 = shellcode
+    2 = rootkit
+    3 = cryptominer
+    4 = ransomware
+
+Architecture:
     3 × TCNBlock (dilations 1, 2, 4)
         dilated causal Conv1d, kernel=3, filters=32
         weight normalization, ReLU, Dropout(0.1)
         residual connection (1×1 conv when dims differ)
-    GlobalAveragePool1d
-    Dense(32 → 16, ReLU)
-    Dense(16 → 1, Sigmoid)
+    GlobalAveragePool1d → (batch, 32)
+    ┌─ Anomaly head:   Linear(32→16, ReLU) → Linear(16→1)
+    └─ Class head:     Linear(32→64, ReLU) → Linear(64→5)
 
 Weights are loaded from models/tcn_weights.pt when the file exists.
-Hyperparameters are read from models/config.json when available; this ensures
-the inference model always matches the trained architecture exactly.
-Random init is used when neither file exists.
+Hyperparameters are read from models/config.json; when absent, defaults apply.
 """
 
 from __future__ import annotations
@@ -33,12 +41,15 @@ if TYPE_CHECKING:
     import numpy as np
 
 # ── Hyperparameter defaults ────────────────────────────────────────────────────
-FEATURE_DIM = 18
+FEATURE_DIM = 20
 SEQUENCE_LENGTH = 16
 KERNEL_SIZE = 3
 NUM_BLOCKS = 3
 FILTERS = 32
 DROPOUT = 0.1
+NUM_CLASSES = 5
+
+ACTIVITY_CLASSES = ["normal", "shellcode", "rootkit", "cryptominer", "ransomware"]
 
 # Resolve to <repo>/models/ regardless of CWD
 _MODELS_DIR = os.path.join(
@@ -92,7 +103,6 @@ class _TCNBlock(nn.Module):
         self.conv2 = weight_norm(_CausalConv1d(out_ch, out_ch, kernel_size, dilation))
         self.drop1 = nn.Dropout(dropout)
         self.drop2 = nn.Dropout(dropout)
-        # 1×1 projection when channel dims differ
         self.residual = nn.Identity() if in_ch == out_ch else nn.Conv1d(in_ch, out_ch, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -105,7 +115,11 @@ class _TCNBlock(nn.Module):
 # ── Model ──────────────────────────────────────────────────────────────────────
 
 class TCNAnomalyDetector(nn.Module):
-    """3-block TCN → GlobalAvgPool → Dense(16, ReLU) → Dense(1, Sigmoid)."""
+    """Shared TCN backbone with two output heads.
+
+    Anomaly head:  Dense(32→16, ReLU) → Dense(16→1)  → raw logit (sigmoid in infer)
+    Class head:    Dense(32→64, ReLU) → Dense(64→5)  → raw logits (softmax in infer)
+    """
 
     def __init__(
         self,
@@ -114,6 +128,7 @@ class TCNAnomalyDetector(nn.Module):
         kernel_size: int = KERNEL_SIZE,
         num_blocks: int = NUM_BLOCKS,
         dropout: float = DROPOUT,
+        num_classes: int = NUM_CLASSES,
     ) -> None:
         super().__init__()
         blocks: list[nn.Module] = []
@@ -126,22 +141,34 @@ class TCNAnomalyDetector(nn.Module):
 
         self.tcn = nn.Sequential(*blocks)
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Sequential(
-            nn.Flatten(),
+        self.flatten = nn.Flatten()
+
+        # Anomaly detection head (binary)
+        self.anomaly_head = nn.Sequential(
             nn.Linear(filters, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, features, sequence) → (batch,) raw logits.
+        # Activity classification head (multi-class)
+        self.class_head = nn.Sequential(
+            nn.Linear(filters, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_classes),
+        )
 
-        Use torch.sigmoid(model(x)) for probabilities, or BCEWithLogitsLoss
-        during training for numerical stability.
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """x: (batch, features, sequence) → (anomaly_logit, class_logits).
+
+        anomaly_logit:  (batch,)    — use sigmoid for probability, BCEWithLogitsLoss in training
+        class_logits:   (batch, 5)  — use softmax/argmax for class, CrossEntropyLoss in training
         """
         x = self.tcn(x)
         x = self.pool(x)
-        return self.head(x).squeeze(-1)
+        x = self.flatten(x)                             # (batch, filters)
+        anomaly_logit = self.anomaly_head(x).squeeze(-1)  # (batch,)
+        class_logits  = self.class_head(x)               # (batch, num_classes)
+        return anomaly_logit, class_logits
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -150,10 +177,10 @@ def load_model(weights_path: str = WEIGHTS_PATH) -> TCNAnomalyDetector:
     """Return an eval-mode detector.
 
     Construction order:
-    1. If models/config.json exists, use its hyperparameters to build the model
-       so the architecture exactly matches what was trained.
-    2. Load weights from weights_path if the file exists.
-    3. Fall back to default hyperparameters + random init if neither file exists.
+    1. If models/config.json exists, use its hyperparameters.
+    2. Load weights from weights_path if the file exists (strict=False so
+       partial weight files — e.g. without class_head — load cleanly).
+    3. Fall back to default hyperparameters + random init otherwise.
     """
     config = _load_config()
     if config:
@@ -162,13 +189,19 @@ def load_model(weights_path: str = WEIGHTS_PATH) -> TCNAnomalyDetector:
             filters=config.get("filters", FILTERS),
             kernel_size=config.get("kernel_size", KERNEL_SIZE),
             num_blocks=config.get("num_blocks", NUM_BLOCKS),
+            num_classes=config.get("num_classes", NUM_CLASSES),
         )
     else:
         model = TCNAnomalyDetector()
 
     if os.path.isfile(weights_path):
         state = torch.load(weights_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state)
+        # strict=False: allows loading weights trained before the class_head was
+        # added, or with a different feature_dim (missing/extra keys are ignored).
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"[tcn] {len(missing)} weight tensors randomly initialised "
+                  f"(not in checkpoint): {missing[:3]}{'…' if len(missing) > 3 else ''}")
 
     model.eval()
     return model
@@ -180,21 +213,26 @@ def save_model(model: TCNAnomalyDetector, weights_path: str = WEIGHTS_PATH) -> N
     torch.save(model.state_dict(), weights_path)
 
 
-def infer(model: TCNAnomalyDetector, window: "np.ndarray") -> float:
+def infer(model: TCNAnomalyDetector, window: "np.ndarray") -> tuple[float, str]:
     """Run one inference pass on a full sliding window.
 
     Args:
         model:  An eval-mode TCNAnomalyDetector.
-        window: numpy array of shape (FEATURE_DIM, SEQUENCE_LENGTH) = (18, 16).
+        window: numpy array of shape (FEATURE_DIM, SEQUENCE_LENGTH) = (20, 16).
                 Accepts (SEQUENCE_LENGTH, FEATURE_DIM) too and transposes automatically.
 
     Returns:
-        Anomaly score in [0.0, 1.0].
+        (anomaly_score, activity_class_name)
+        anomaly_score:      float in [0.0, 1.0]
+        activity_class_name: one of ACTIVITY_CLASSES
     """
     if window.shape == (SEQUENCE_LENGTH, FEATURE_DIM):
         window = window.T  # → (FEATURE_DIM, SEQUENCE_LENGTH)
-    tensor = torch.from_numpy(window).unsqueeze(0).float()  # (1, 18, 16)
+    tensor = torch.from_numpy(window).unsqueeze(0).float()  # (1, 20, 16)
     with torch.no_grad():
-        logit = model(tensor)
-        score = torch.sigmoid(logit)
-    return float(score.squeeze().item())
+        anomaly_logit, class_logits = model(tensor)
+        anomaly_score = float(torch.sigmoid(anomaly_logit).squeeze().item())
+        class_idx     = int(class_logits.argmax(dim=-1).squeeze().item())
+
+    class_name = ACTIVITY_CLASSES[class_idx] if 0 <= class_idx < len(ACTIVITY_CLASSES) else "unknown"
+    return anomaly_score, class_name

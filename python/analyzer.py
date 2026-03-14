@@ -1,10 +1,14 @@
 """hypTcn analyzer — asyncio UDS server.
 
-Reads 4104-byte frames from the Go scanner:
-    [8B physical address, little-endian uint64][4096B raw page data]
+Reads 4112-byte frames from the Go scanner:
+    [8B physical address, little-endian uint64]
+    [4B kernel_module_count_norm, little-endian float32]
+    [4B network_conn_count_norm,  little-endian float32]
+    [4096B raw page data]
 
 Per frame:
-  - Extracts 18-element feature vector via model.features (with prev_features)
+  - Extracts 20-element feature vector via model.features (with prev_features
+    and OS-layer normalized counts from the frame header)
   - Optionally logs raw frame + features to --log-dir as .npy files
   - Appends to a 16-frame sliding window deque
   - When window is full: runs TCN inference, emits JSON
@@ -12,18 +16,19 @@ Per frame:
 JSON output format:
   socket (read by Go engine):
     warming up:  {"anomaly_score": 0.0, "status": "warming_up"}
-    live score:  {"anomaly_score": <float>, "status": "ok"}
+    live score:  {"anomaly_score": <float>, "activity_class": <str>, "status": "ok"}
   stdout (human-readable):
     warming up:  {"status": "warming_up", "frames": <n>}
     live score:  {"timestamp": <unix_ms>, "addr": <hex_str>,
-                  "score": <float>, "alert": <bool>, "status": "ok"}
+                  "score": <float>, "alert": <bool>,
+                  "activity_class": <str>, "status": "ok"}
 
 alert = True when score > 0.85.
 
 --log-dir layout:
   <log-dir>/<label>/<timestamp_ms>_<addr_hex>.npy
   label defaults to "unknown"; rename folder to "normal" or "malware" after capture.
-  Each file: np.save(..., {"features": (18,), "addr": int, "timestamp_ms": int,
+  Each file: np.save(..., {"features": (20,), "addr": int, "timestamp_ms": int,
                             "raw_page": (4096,) uint8}, allow_pickle=True)
 """
 
@@ -43,14 +48,14 @@ import numpy as np
 from model import features as feature_extractor
 from model import tcn as tcn_model
 
-PAGE_SIZE = 4096
-HEADER_SIZE = 8
-FRAME_SIZE = HEADER_SIZE + PAGE_SIZE          # 4104 bytes
+PAGE_SIZE   = 4096
+HEADER_SIZE = 16              # 8 (addr) + 4 (mod_norm) + 4 (conn_norm)
+FRAME_SIZE  = HEADER_SIZE + PAGE_SIZE    # 4112 bytes
 SOCKET_PATH = "/tmp/hyptcn.sock"
-_LOG_INTERVAL = 100                           # print stderr notice every N frames
+_LOG_INTERVAL = 100           # print stderr notice every N frames
 
 # Load model and config once at startup.
-_MODEL = tcn_model.load_model()
+_MODEL  = tcn_model.load_model()
 _CONFIG = tcn_model._load_config()
 ALERT_THRESHOLD = _CONFIG.get("alert_threshold", 0.85) if _CONFIG else 0.85
 SEQUENCE_LENGTH = tcn_model.SEQUENCE_LENGTH   # 16
@@ -58,11 +63,11 @@ SEQUENCE_LENGTH = tcn_model.SEQUENCE_LENGTH   # 16
 
 def _print_startup_info() -> None:
     if _CONFIG:
-        ver = _CONFIG.get("model_version", "?")
-        trained_at = _CONFIG.get("trained_at", "unknown")[:10]  # date only
-        ts = _CONFIG.get("training_stats", {})
-        val_loss = ts.get("best_val_loss", float("nan"))
-        roc_auc = ts.get("roc_auc", float("nan"))
+        ver        = _CONFIG.get("model_version", "?")
+        trained_at = _CONFIG.get("trained_at", "unknown")[:10]
+        ts         = _CONFIG.get("training_stats", {})
+        val_loss   = ts.get("best_val_loss", float("nan"))
+        roc_auc    = ts.get("roc_auc", float("nan"))
         print(
             f"[analyzer] model v{ver} trained {trained_at}, "
             f"val_loss={val_loss:.4f}, ROC-AUC={roc_auc:.4f}",
@@ -87,15 +92,17 @@ def _encode(obj: dict) -> bytes:
 # ── frame reader ───────────────────────────────────────────────────────────────
 
 async def _iter_frames(reader: asyncio.StreamReader):
-    """Yield (address, payload) pairs from the raw UDS stream."""
+    """Yield (address, payload, mod_norm, conn_norm) tuples from the raw UDS stream."""
     while True:
         try:
-            header = await reader.readexactly(HEADER_SIZE)
+            header  = await reader.readexactly(HEADER_SIZE)
             payload = await reader.readexactly(PAGE_SIZE)
         except asyncio.IncompleteReadError:
             return
-        address = struct.unpack("<Q", header)[0]
-        yield address, payload
+        address   = struct.unpack("<Q", header[0:8])[0]
+        mod_norm  = struct.unpack("<f", header[8:12])[0]
+        conn_norm = struct.unpack("<f", header[12:16])[0]
+        yield address, payload, mod_norm, conn_norm
 
 
 # ── frame logger ───────────────────────────────────────────────────────────────
@@ -117,10 +124,10 @@ def _log_frame(
     np.save(
         fpath,
         {
-            "features": features,
-            "addr": address,
+            "features":     features,
+            "addr":         address,
             "timestamp_ms": timestamp_ms,
-            "raw_page": np.frombuffer(payload, dtype=np.uint8),
+            "raw_page":     np.frombuffer(payload, dtype=np.uint8),
         },
         allow_pickle=True,
     )
@@ -141,11 +148,15 @@ async def _handle(
     frame_count = 0
 
     try:
-        async for address, payload in _iter_frames(reader):
+        async for address, payload, mod_norm, conn_norm in _iter_frames(reader):
             timestamp_ms = int(time.time() * 1000)
             frame_count += 1
 
-            vec = feature_extractor.extract(payload, address, prev_features)
+            vec = feature_extractor.extract(
+                payload, address, prev_features,
+                kernel_module_count_norm=mod_norm,
+                network_conn_count_norm=conn_norm,
+            )
             prev_features = vec
             window.append(vec)
             n = len(window)
@@ -157,16 +168,21 @@ async def _handle(
                 socket_response = {"anomaly_score": 0.0, "status": "warming_up"}
                 stdout_response = {"status": "warming_up", "frames": n}
             else:
-                # Stack deque into (FEATURE_DIM=18, SEQUENCE_LENGTH=16)
-                seq = np.stack(list(window), axis=1)   # (18, 16)
-                score = tcn_model.infer(_MODEL, seq)
-                socket_response = {"anomaly_score": round(score, 6), "status": "ok"}
-                stdout_response = {
-                    "timestamp": timestamp_ms,
-                    "addr": hex(address),
-                    "score": round(score, 6),
-                    "alert": score > ALERT_THRESHOLD,
+                # Stack deque into (FEATURE_DIM=20, SEQUENCE_LENGTH=16)
+                seq = np.stack(list(window), axis=1)   # (20, 16)
+                score, activity_class = tcn_model.infer(_MODEL, seq)
+                socket_response = {
+                    "anomaly_score": round(score, 6),
+                    "activity_class": activity_class,
                     "status": "ok",
+                }
+                stdout_response = {
+                    "timestamp":     timestamp_ms,
+                    "addr":          hex(address),
+                    "score":         round(score, 6),
+                    "alert":         score > ALERT_THRESHOLD,
+                    "activity_class": activity_class,
+                    "status":        "ok",
                 }
 
             _emit(stdout_response)
