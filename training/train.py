@@ -113,8 +113,14 @@ def train(
     weight_decay: float = 1e-4,
     patience: int = 10,
     seed: int = 42,
+    data_source: str = "npy",
+    collect_dir: str = "collect_for_training",
 ) -> dict:
-    """Train TCNAnomalyDetector; save weights and config.json to output_dir."""
+    """Train TCNAnomalyDetector; save weights and config.json to output_dir.
+
+    data_source: "npy"     — load from data_dir/*.npy (default, synthetic-compatible)
+                 "collect" — load from collect_dir/*.bin (Go collector output)
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -122,12 +128,15 @@ def train(
     print(f"Device: {device}")
 
     # ── data ──────────────────────────────────────────────────────────────────
-    _ensure_data(data_dir)
-
     sys.path.insert(0, _TRAINING_DIR)
-    from dataset import MemoryPageDataset, stratified_split  # noqa: PLC0415
+    from dataset import MemoryPageDataset, BinFrameDataset, stratified_split  # noqa: PLC0415
 
-    dataset = MemoryPageDataset(data_dir)
+    if data_source == "collect":
+        print(f"Loading .bin frames from {collect_dir!r}…")
+        dataset = BinFrameDataset(collect_dir)
+    else:
+        _ensure_data(data_dir)
+        dataset = MemoryPageDataset(data_dir)
     print(dataset.summary())
 
     if len(dataset) == 0:
@@ -284,6 +293,7 @@ def train(
             "roc_auc":           round(roc_auc, 6),
         },
         "dataset_stats": {
+            "data_source":     data_source,
             "normal_samples":  dataset.n_normal,
             "malware_samples": dataset.n_malware,
             "train_split":     0.70,
@@ -328,12 +338,17 @@ def _roc_auc(labels: np.ndarray, scores: np.ndarray) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train hypTcn anomaly detector")
-    parser.add_argument("--data-dir",   default="data")
-    parser.add_argument("--epochs",     type=int,   default=50)
-    parser.add_argument("--batch-size", type=int,   default=32)
-    parser.add_argument("--lr",         type=float, default=1e-3)
-    parser.add_argument("--output-dir", default="models")
-    parser.add_argument("--seed",       type=int,   default=42)
+    parser.add_argument("--data-dir",     default="data",
+                        help="Root dir with normal/ and malware/ .npy subdirs (npy mode)")
+    parser.add_argument("--data-source",  default="npy", choices=["npy", "collect"],
+                        help="'npy' = synthetic/npy files; 'collect' = raw .bin frames from Go collector")
+    parser.add_argument("--collect-dir",  default="collect_for_training",
+                        help="Root dir with label subdirs of .bin frames (collect mode)")
+    parser.add_argument("--epochs",       type=int,   default=50)
+    parser.add_argument("--batch-size",   type=int,   default=32)
+    parser.add_argument("--lr",           type=float, default=1e-3)
+    parser.add_argument("--output-dir",   default="models")
+    parser.add_argument("--seed",         type=int,   default=42)
     args = parser.parse_args()
 
     train(
@@ -343,6 +358,8 @@ def main() -> None:
         batch_size=args.batch_size,
         lr=args.lr,
         seed=args.seed,
+        data_source=args.data_source,
+        collect_dir=args.collect_dir,
     )
 
 
