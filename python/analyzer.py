@@ -55,8 +55,9 @@ SOCKET_PATH = "/tmp/hyptcn.sock"
 _LOG_INTERVAL = 100           # print stderr notice every N frames
 
 # Load model and config once at startup.
+# load_model() resolves: python/model/weights/ (primary) → models/ (fallback)
 _MODEL  = tcn_model.load_model()
-_CONFIG = tcn_model._load_config()
+_CONFIG = tcn_model._load_config(tcn_model._resolve("config.json"))
 ALERT_THRESHOLD = _CONFIG.get("alert_threshold", 0.85) if _CONFIG else 0.85
 SEQUENCE_LENGTH = tcn_model.SEQUENCE_LENGTH   # 16
 

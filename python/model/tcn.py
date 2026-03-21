@@ -51,13 +51,23 @@ NUM_CLASSES = 5
 
 ACTIVITY_CLASSES = ["normal", "shellcode", "rootkit", "cryptominer", "ransomware"]
 
-# Resolve to <repo>/models/ regardless of CWD
-_MODELS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "models",
+# Primary: python/model/weights/ (written by ml/pipeline/export.py)
+# Fallback: <repo>/models/         (written by training/train.py, legacy)
+_THIS_DIR    = os.path.dirname(os.path.abspath(__file__))
+_WEIGHTS_DIR = os.path.join(_THIS_DIR, "weights")
+_LEGACY_DIR  = os.path.join(
+    os.path.dirname(os.path.dirname(_THIS_DIR)), "models"
 )
-WEIGHTS_PATH = os.path.join(_MODELS_DIR, "tcn_weights.pt")
-CONFIG_PATH = os.path.join(_MODELS_DIR, "config.json")
+
+def _resolve(filename: str) -> str:
+    """Return primary path if it exists, else fallback."""
+    primary = os.path.join(_WEIGHTS_DIR, filename)
+    if os.path.isfile(primary):
+        return primary
+    return os.path.join(_LEGACY_DIR, filename)
+
+WEIGHTS_PATH = _resolve("tcn_weights.pt")
+CONFIG_PATH  = _resolve("config.json")
 
 
 def _load_config(config_path: str = CONFIG_PATH) -> dict | None:
@@ -173,7 +183,7 @@ class TCNAnomalyDetector(nn.Module):
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def load_model(weights_path: str = WEIGHTS_PATH) -> TCNAnomalyDetector:
+def load_model(weights_path: str = "") -> TCNAnomalyDetector:
     """Return an eval-mode detector.
 
     Construction order:
@@ -182,7 +192,11 @@ def load_model(weights_path: str = WEIGHTS_PATH) -> TCNAnomalyDetector:
        partial weight files — e.g. without class_head — load cleanly).
     3. Fall back to default hyperparameters + random init otherwise.
     """
-    config = _load_config()
+    # Re-resolve at call time so that a newly exported model is picked up
+    # even if the module was imported before the file existed.
+    if not weights_path:
+        weights_path = _resolve("tcn_weights.pt")
+    config = _load_config(_resolve("config.json"))
     if config:
         model = TCNAnomalyDetector(
             feature_dim=config.get("feature_dim", FEATURE_DIM),
