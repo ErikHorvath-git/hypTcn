@@ -1,6 +1,6 @@
 {
   "model_version": "2.0.0",
-  "trained_at": "2026-03-21T22:21:08.344425+00:00",
+  "trained_at": "2026-03-22T22:38:45.899813+00:00",
   "feature_dim": 20,
   "sequence_length": 16,
   "filters": 32,
@@ -21,13 +21,13 @@
     "ransomware"
   ],
   "training_stats": {
-    "epochs": 5,
-    "final_train_loss": 2.285053,
-    "final_val_loss": 0.0,
-    "best_val_loss": 0.0,
-    "class_accuracy": 0.0,
-    "f1_score": 0.0,
-    "roc_auc": 0.5
+    "epochs": 50,
+    "final_train_loss": 0.443994,
+    "final_val_loss": 0.352148,
+    "best_val_loss": 0.352148,
+    "class_accuracy": 0.828947,
+    "f1_score": 1.0,
+    "roc_auc": 1.0
   },
   "weights_path": "python/model/weights/tcn_weights.pt"
 }
