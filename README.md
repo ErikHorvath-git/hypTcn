@@ -1,367 +1,411 @@
-# hypTCn
+# hypTcn
 
-hypTCn samples raw 4 KiB physical memory pages from a running KVM guest via libvmi — from outside the VM, at the hypervisor boundary — and classifies sliding windows of 16 consecutive pages as normal or anomalous using a PyTorch Temporal Convolutional Network (TCN). The guest has zero footprint: no agent, no kernel hooks, nothing detectable from inside. A TCN is used instead of a snapshot classifier because sequences of 16 pages capture temporal patterns — entropy drift, NOP-sled persistence, address-scan behaviour — that a single-frame classifier cannot see. This is a diploma thesis project targeting APT-class threats: shellcode injection, rootkits, cryptominers, and ransomware.
+Hypervisor-aware security toolkit pre live memory introspection KVM guestov. Číta 4 KiB fyzické pamäťové stránky z bežiacej VM cez libvmi a analyzuje ich PyTorch Temporal Convolutional Network (TCN) — detekuje anomálie a klasifikuje aktivitu (shellcode, rootkit, cryptominer, ransomware, normal).
+
+Guest má **nulový footprint** — žiadny agent, žiadne kernel hooky, nič detekovateľné zvnútra VM. TCN namiesto snapshot klasifikátora preto, že sekvencie 16 stránok zachytávajú temporálne vzory (entropia drift, NOP-sled perzistencia, address-scan správanie) ktoré jednorámový klasifikátor nevidí.
 
 ---
 
-## Quick Start
+## Ako to funguje
 
-### Prerequisites
-
-- Fedora or Debian host with KVM/QEMU
-- libvmi built from source with `ENABLE_KVM_LEGACY=ON` (the Fedora DNF package is Xen-only)
-- Go 1.21+, Python 3.10+, PyTorch ≥ 2.0
-- Your user in the `kvm` and `libvirt` groups
-
-### 1. Build libvmi (one time)
-
-The stock Fedora `libvmi` package has no KVM support. The legacy KVM driver uses libvirt QMP which works with stock QEMU; the new driver requires a patched QEMU with KVMI sockets.
-
-```sh
-sudo dnf install -y gcc make cmake bison flex autoconf automake libtool pkg-config \
-    libvirt-devel json-c-devel glib2-devel
-
-git clone https://github.com/libvmi/libvmi.git ~/libvmi-src
-cd ~/libvmi-src && mkdir build && cd build
-
-cmake .. \
-  -DENABLE_KVM=ON \
-  -DENABLE_KVM_LEGACY=ON \
-  -DENABLE_XEN=OFF \
-  -DENABLE_FILE=ON \
-  -DCMAKE_INSTALL_PREFIX=/usr/local
-
-make -j$(nproc)
-sudo make install
-sudo ldconfig
-
-# Verify KVM support is compiled in:
-strings /usr/local/lib64/libvmi.so | grep -i kvm
-# must print: VMI_KVM   VMI_INIT_DATA_KVMI_SOCKET
+```
+KVM Guest (hyptcn-guest)
+        │
+        │  libvmi — fyzická pamäť, bez agenta v guest
+        ▼
+  Go Scanner (bin/hyptcn)
+        │  čítanie 4096B stránok + OS-layer info (procesy, moduly, spojenia)
+        │  Unix domain socket  [8B addr | 4B modules | 4B connections | 4096B page]
+        ▼
+  Python Analyzer (python/analyzer.py)
+        │  16-frame sliding window → 20 features/frame
+        ▼
+  TCN model (3 dilated bloky, 2 hlavy)
+        ├─ anomaly score  (0–1, alert ak > 0.85)
+        └─ activity class (normal / shellcode / rootkit / cryptominer / ransomware)
 ```
 
-> **Note:** Both `kvm.c` and `kvm_legacy.c` hardcode `qemu:///system` upstream. If your VM runs under `qemu:///session` (user session daemon), patch both files before building: `sed -i 's|qemu:///system|qemu:///session|g' src/driver/kvm/kvm.c src/driver/kvm/kvm_legacy.c`
+---
 
-### 2. Build hyptcn
+## Požiadavky
 
-```sh
-make
-# → bin/hyptcn, rpath-linked to /usr/local/lib64/libvmi
+**Systém (Fedora):**
+```bash
+sudo dnf install make gcc go python3 libvmi-devel qemu-kvm libvirt
+sudo usermod -aG kvm,libvirt $USER
 ```
 
-### 3. Install Python deps
-
-```sh
-python3 -m venv .venv
-.venv/bin/pip install -r python/requirements.txt
+**Python venv:**
+```bash
+make deps   # vytvorí .venv a nainštaluje torch, numpy
 ```
 
-Always use `.venv/bin/python` — system python3 does not have torch.
+---
 
-### 4. Create KVM guest (if you don't have one)
+## Od git clone po spustenie
 
-```sh
-# Download Debian 12 cloud image
-wget https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
+### 1. Klon a build
 
-# Create a 20 GiB overlay
-qemu-img create -f qcow2 -b debian-12-genericcloud-amd64.qcow2 -F qcow2 hyptcn-guest.qcow2 20G
+```bash
+git clone <repo-url> hypTcn
+cd hypTcn
+make deps        # Python .venv
+make             # Go binary → bin/hyptcn
+```
 
-# Create cloud-init seed (sets root password + SSH key)
-cat > user-data.yaml <<'EOF'
-#cloud-config
-password: hyptcn
-chpasswd: {expire: false}
-ssh_pwauth: true
+### 2. VM setup
+
+Potrebuješ KVM guest `hyptcn-guest` s Debian 12 Bookworm:
+
+```bash
+# Base image
+wget https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2 \
+     -O ~/vms/debian-12-base.qcow2
+
+# Overlay disk (zmeny sa ukladajú sem, base zostáva čistý)
+qemu-img create -f qcow2 -b ~/vms/debian-12-base.qcow2 -F qcow2 ~/vms/hyptcn-guest.qcow2 20G
+
+# Definuj VM
+virsh --connect qemu:///session define configs/hyptcn-guest-template.xml
+
+# Nastav root heslo (cez guestfish, VM musí byť vypnutá)
+sudo bash tools/mount_vm.sh
+```
+
+### 3. Spusti VM a SSH
+
+```bash
+virsh --connect qemu:///session start hyptcn-guest
+
+# Po prvom štarte nastav statickú IP vo VM konzole:
+virsh --connect qemu:///session console hyptcn-guest
+# Vo VM:
+#   ip link set enp1s0 up
+#   ip addr add 192.168.122.100/24 dev enp1s0
+#   ip route add default via 192.168.122.1
+#   ssh-keygen -A && systemctl start ssh
+
+# Skopíruj SSH kľúč
+ssh-copy-id root@192.168.122.100
+
+# Nastav persistentnú IP (raz)
+ssh root@192.168.122.100 'cat > /etc/systemd/network/10-enp1s0.network << EOF
+[Match]
+Name=enp1s0
+[Network]
+Address=192.168.122.100/24
+Gateway=192.168.122.1
+DNS=192.168.122.1
 EOF
-cloud-localds seed.iso user-data.yaml
-
-# Define and start the VM
-virt-install \
-  --name hyptcn-guest \
-  --memory 2048 \
-  --vcpus 2 \
-  --disk path=hyptcn-guest.qcow2,format=qcow2 \
-  --disk path=seed.iso,device=cdrom \
-  --os-variant debian12 \
-  --network network=default \
-  --graphics none \
-  --noautoconsole \
-  --import
-
-virsh domstate hyptcn-guest   # → running
+systemctl enable systemd-networkd'
 ```
 
-### 5. Start everything
+> **Po každom reštarte hosta** obnov NAT:
+> ```bash
+> sudo bash tools/fix_nat.sh
+> ```
 
-**Terminal 1 — Python analyzer (must start first):**
-```sh
-cd python && ../.venv/bin/python analyzer.py --socket /tmp/hyptcn.sock
+### 4. Skopíruj System.map z VM
+
+libvmi potrebuje System.map pre OS-layer introspekciu (procesy, moduly, TCP spojenia):
+
+```bash
+./tools/get_sysmap.sh hyptcn-guest
+# Uloží do: configs/hyptcn-guest.sysmap
 ```
 
-**Terminal 2 — Go scanner:**
-```sh
-# Mock mode (no VM required, useful for testing the full pipeline):
-./bin/hyptcn --mock --interval 100
+Ak get_sysmap.sh zlyhá (placeholder System.map v cloud image):
+```bash
+# Vo VM nainštaluj debug kernel package
+ssh root@192.168.122.100 'apt-get install -y linux-image-$(uname -r | sed "s/-amd64$/-amd64-dbg/")'
 
-# Live VM:
-./bin/hyptcn --vm hyptcn-guest --address 0x1000000 --interval 500
+# Skopíruj reálny System.map
+scp root@192.168.122.100:/usr/lib/debug/boot/System.map-$(ssh root@192.168.122.100 uname -r) \
+    configs/hyptcn-guest.sysmap
 ```
 
-**Terminal 3 — watch live scores:**
-```sh
-# Scores appear on analyzer stdout once the 16-frame window fills:
-# {"timestamp":1773264369956,"addr":"0x1000000","score":0.0,"alert":false,"status":"ok"}
+### 5. Nastav libvmi.conf
+
+```bash
+sudo tee /etc/libvmi/libvmi.conf << EOF
+hyptcn-guest {
+    ostype = "Linux";
+    sysmap = "$(pwd)/configs/hyptcn-guest.sysmap";
+}
+EOF
 ```
 
-Expected mock output (random pages are max-entropy → model correctly flags as anomalous):
-```
-{"timestamp":…, "addr":"0x1000", "score":1.0, "alert":true, "status":"ok"}
-```
+### 6. Natrénuj model
 
-Expected live idle-VM output (kernel pages are low-entropy → model scores as normal):
-```
-{"timestamp":…, "addr":"0x1000000", "score":0.0, "alert":false, "status":"ok"}
+```bash
+./train.sh
 ```
 
-### 6. Collect training data
+Čo robí:
+1. Vygeneruje 4000 syntetických frames (2000 normal + 500 každá malware trieda)
+2. Natrénuje TCN na 50 epoch s early stopping
+3. Nasadí váhy do `python/model/weights/tcn_weights.pt`
 
-```sh
-# One-time guest setup (installs stress-ng, ransomware sim, Diamorphine):
-./collect_for_training/scripts/prepare_malware_env.sh hyptcn-guest
+Výsledky aktuálneho modelu:
+- class_accuracy: **82.9 %**  |  F1: **1.0**  |  ROC-AUC: **1.0**
 
-# Interactive wizard — walks through all 5 labels one by one:
-./collect_for_training/scripts/collect_all_labels.sh hyptcn-guest
+### 7. Spusti monitoring
+
+```bash
+./run.sh
 ```
 
-Frames are written to `collect_for_training/<label>/` as 4108-byte `.bin` files. No Python analyzer needed during collection — the Go binary writes raw frames directly.
+Spustí Python analyzer aj Go scanner naraz. Výstup na stdout:
 
-### 7. Train the model
-
-```sh
-./collect_for_training/scripts/quick_train.sh
-# or manually:
-.venv/bin/python training/train.py --data-source collect --collect-dir collect_for_training/
-```
-
-Saves `models/tcn_weights.pt` and `models/config.json`. Restart the analyzer to pick up new weights.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│  KVM Guest  (Debian 12, QEMU/KVM)               │
-│  Physical RAM — no agent, zero guest footprint   │
-└─────────────────┬───────────────────────────────┘
-                  │  libvmi vmi_read_pa() / vmi_init_complete()
-                  │  KVM legacy driver → qemu:///session → QMP xp
-                  ▼
-┌─────────────────────────────────────────────────┐
-│  C Extractor  internal/extractor/probe.c        │
-│  hyptcn_vmi_open[_with_sysmap](vm_name)         │
-│  hyptcn_read_page(handle, phys_addr, buf)        │
-│  hyptcn_get_process_list / _kernel_modules /     │
-│  _network_connections / _translate_v2p           │
-└─────────────────┬───────────────────────────────┘
-                  │  CGO  (-I/usr/local/include -lvmi -rpath)
-                  ▼
-┌─────────────────────────────────────────────────┐
-│  Go Orchestrator  internal/orchestrator/engine.go│
-│  Engine.Stream(ctx, physAddr, interval)          │
-│    ├─ NORMAL MODE: analyze frame → UDS → Python  │
-│    │    wire: [8B addr][4B mod_norm][4B conn_norm]│
-│    │           [4096B page] = 4112 bytes          │
-│    └─ COLLECT MODE: write .bin → no Python needed│
-│         format: [8B addr][4B label_id][4096B page]│
-│                 = 4108 bytes per file             │
-└─────────────────┬───────────────────────────────┘
-                  │  Unix Domain Socket /tmp/hyptcn.sock
-                  ▼
-┌─────────────────────────────────────────────────┐
-│  Python Analyzer  python/analyzer.py            │
-│  asyncio UDS server, 16-frame sliding window     │
-│  features.extract() → (20,) float32 per frame   │
-│  → tcn.infer() → (anomaly_score, activity_class) │
-│  socket response (JSON, newline-terminated):     │
-│    {"anomaly_score":0.51,"status":"ok",          │
-│     "activity_class":"shellcode"}                │
-└─────────────────┬───────────────────────────────┘
-                  │  PyTorch  ~0.34 ms/window (CPU)
-                  ▼
-┌─────────────────────────────────────────────────┐
-│  TCN Model  python/model/tcn.py                 │
-│  Input: (1, 20, 16)                             │
-│  3 × TCNBlock (dilations 1, 2, 4)               │
-│      dilated causal Conv1d, k=3, filters=32      │
-│      weight_norm + ReLU + Dropout(0.1) + residual│
-│  GlobalAvgPool → (1, 32)                        │
-│  ├─ Anomaly head: Linear(32→16,ReLU)→Linear(16→1)│
-│  └─ Class head:  Linear(32→64,ReLU)→Linear(64→5)│
-│  Weights: models/tcn_weights.pt                 │
-└─────────────────────────────────────────────────┘
+```json
+{"timestamp": 1774219200394, "addr": "0x1000000", "score": 0.0, "alert": false, "activity_class": "normal", "status": "ok"}
 ```
 
 ---
 
-## Features (20 features)
+## Každodenný workflow
 
-All values `float32 ∈ [0, 1]`. First frame: `entropy_delta = 0.5`, `addr_delta = 0.0`.
+```bash
+# Po reštarte hosta
+sudo bash tools/fix_nat.sh
+virsh --connect qemu:///session start hyptcn-guest
 
-| # | Name | Description |
-|---|------|-------------|
-| 0 | `byte_entropy` | Shannon H / 8 — packed/encrypted code → near 1.0 |
-| 1 | `nonzero_ratio` | count(b≠0) / 4096 — zero-padded pages → low |
-| 2 | `printable_ratio` | count(0x20≤b≤0x7E) / 4096 — binary vs string pages |
-| 3 | `high_byte_ratio` | count(b>0x7F) / 4096 — encoded/obfuscated content |
-| 4 | `unique_bytes` | distinct byte values / 256 — crypto buffers → near 1.0 |
-| 5 | `top4_freq` | sum(top-4 byte counts) / 4096 — NOP sleds / zero pages → high |
-| 6 | `zero_runs` | count(zero-runs > 8) / 100 — uninitialised pages → high |
-| 7 | `addr_norm` | phys_addr / 0xFFFFFFFFFFFF — kernel vs userspace position |
-| 8 | `entropy_blocks_std` | std(H per 256B block) / 0.5 — mixed pages: header + payload |
-| 9 | `compression_ratio` | zlib(page,1) size / 4096 — low=repetitive, high=packed/crypto |
-| 10 | `null_run_ratio` | bytes inside zero-runs > 8 / 4096 — BSS/uninitialised → high |
-| 11 | `pe_header_score` | 0.0 no MZ / 0.5 MZ only / 1.0 MZ+PE — injected PE / reflective DLL |
-| 12 | `elf_header_score` | 0.0 / 0.5 / 1.0 ELF magic — ELF mapped into guest memory |
-| 13 | `syscall_pattern_count` | count(SYSCALL\|INT80\|SYSENTER) / 100 — shellcode syscall density |
-| 14 | `nop_sled_score` | bytes inside 0x90-runs > 8 / 4096 — NOP sled before shellcode |
-| 15 | `string_density` | count(printable runs ≥ 4) / 100 — C2 URLs / config strings |
-| 16 | `entropy_delta` | (H[t]−H[t-1]+1)/2 — entropy spike/drop over time **(temporal)** |
-| 17 | `addr_delta` | (addr[t]−addr[t-1]) / 0xFFFFFFFFFFFF — non-sequential jumps **(temporal)** |
-| 18 | `kernel_module_count_norm` | loaded kernel modules / 200 — rootkit detection **(OS layer)** |
-| 19 | `network_conn_count_norm` | active TCP connections / 100 — C2/exfil detection **(OS layer)** |
+# Spusti monitoring
+./run.sh
 
-OS-layer features (18–19) are `0.0` in mock/raw mode. The `--sysmap` flag enables them.
+# Pretrénuj model (po zbere nových dát alebo zmenách)
+./train.sh
+
+# Obnov System.map po upgrade kernelu v guest
+./tools/get_sysmap.sh hyptcn-guest
+```
 
 ---
 
-## CLI Reference
+## Štruktúra projektu
 
-```sh
+```
+hypTcn/
+│
+├── run.sh                      # Spustí celý pipeline (analyzer + scanner)
+├── train.sh                    # Generuje dáta + trénuje + nasadí váhy
+├── Makefile                    # Build Go binary, Python venv (make / make deps / make clean)
+│
+├── cmd/hyptcn/
+│   └── main.go                 # Cobra CLI vstupný bod Go scannera
+│
+├── internal/
+│   ├── extractor/
+│   │   ├── probe.c             # libvmi C wrapper (open/read/close/procesy/moduly/sieť)
+│   │   ├── probe.h
+│   │   └── extractor.go        # CGO bridge pre Go
+│   └── orchestrator/
+│       └── engine.go           # Hlavná slučka: čítanie pamäte → UDS → JSON response
+│
+├── python/
+│   ├── analyzer.py             # asyncio UDS server, 16-frame sliding window
+│   ├── requirements.txt
+│   └── model/
+│       ├── tcn.py              # TCNAnomalyDetector (backbone + anomaly head + class head)
+│       ├── features.py         # Extrakcia 20 features z 4096B stránky
+│       ├── __init__.py
+│       └── weights/
+│           └── tcn_weights.pt  # Natrénované váhy (nasadené cez train.sh)
+│
+├── ml/
+│   ├── pipeline/
+│   │   ├── generate_data.py    # Generuje syntetické processed .npy dáta priamo
+│   │   ├── train.py            # Trénovací skript (načíta processed/, uloží váhy)
+│   │   ├── preprocess.py       # Raw .bin frames → windowed numpy arrays
+│   │   ├── evaluate.py         # Evaluácia natrénovaného modelu
+│   │   └── export.py           # Export váh do deployment formátu
+│   ├── data/
+│   │   ├── raw/                # Surové .bin frames (label/frameN.bin)
+│   │   │   ├── normal/         # Sem kopíruj reálne frames z normálnej VM
+│   │   │   ├── shellcode/
+│   │   │   ├── rootkit/
+│   │   │   ├── cryptominer/
+│   │   │   └── ransomware/
+│   │   ├── processed/          # Auto-generované numpy arrays (vstup pre train.py)
+│   │   │   ├── X_train.npy     #   shape (N, 20, 16) float32
+│   │   │   ├── X_val.npy
+│   │   │   ├── X_test.npy
+│   │   │   ├── y_anomaly_*.npy #   shape (N,) float32 — 0=normal, 1=malware
+│   │   │   └── y_class_*.npy   #   shape (N,) int64  — 0..4
+│   │   └── synthetic/          # Auto-generované syntetické frames (.npy dicts)
+│   └── models/
+│       ├── tcn_weights.pt      # Záloha natrénovaných váh
+│       └── config.json         # Hyperparametre + tréningové štatistiky
+│
+├── training/
+│   └── synthetic.py            # Generátor syntetických feature vektorov (5 tried)
+│                               # Definuje realistické distribúcie pre každú triedu
+│
+├── configs/
+│   └── hyptcn-guest.sysmap     # System.map z KVM guest — obnov po upgrade kernelu!
+│
+├── collect_for_training/       # Manuálne nazbierané .bin frames z reálnej VM
+│   ├── normal/                 # Zbieraj počas normálnej VM aktivity
+│   ├── shellcode/              # Zbieraj počas simulovaného shellcode útoku
+│   ├── rootkit/
+│   ├── cryptominer/
+│   └── ransomware/
+│
+├── tools/
+│   ├── fix_nat.sh              # Obnoví iptables MASQUERADE pre VM internet po reštarte
+│   ├── fix_network.sh          # Opraví orphaned virbr0 bridge (libvirt network reset)
+│   ├── get_sysmap.sh           # Skopíruje System.map z VM na host cez SSH/SCP
+│   └── mount_vm.sh             # Mountuje VM disk offline (guestfish) — na debug/password reset
+│
+├── bin/
+│   └── hyptcn                  # Skompilovaný Go binary (po make)
+│
+└── models/                     # Alias — kompatibilita so starším kódom
+    └── tcn_weights.pt
+```
+
+---
+
+## CLI flags
+
+```
 ./bin/hyptcn [flags]
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--vm` | `""` | KVM domain name (libvmi) |
-| `--socket` | `/tmp/hyptcn.sock` | Analyzer Unix domain socket path |
-| `--sysmap` | `""` | System.map path — enables `vmi_init_complete`, OS-layer features |
-| `--address` | `0x1000000` | Physical address to sample (non-mock mode) |
-| `--interval` | `100` | Sampling interval in milliseconds |
-| `--proc-interval` | `100` | OS-layer scan (process/module/connection) every N frames |
-| `--mock` | `false` | Use `crypto/rand` pages instead of libvmi |
-| `--collect` | `false` | Enable dataset collection mode — writes `.bin` frames, no Python needed |
-| `--collect-label` | `normal` | Label: `normal\|malware\|shellcode\|rootkit\|cryptominer\|ransomware` |
-| `--collect-duration` | `300` | Collection duration in seconds; `0` = run until Ctrl-C |
-| `--collect-dir` | `collect_for_training/` | Root output directory for `.bin` frame files |
-| `--log-level` | `info` | Structured log level: `debug\|info\|warn\|error` |
-| `--json` | `true` | Print analysis scores as JSON lines to stdout |
-| `--quiet` | `false` | Suppress stdout JSON (overrides `--json`) |
+| Flag | Default | Popis |
+|------|---------|-------|
+| `--vm` | — | Názov KVM guest (povinný bez `--mock`) |
+| `--sysmap` | — | Cesta k System.map — zapne OS-layer mode |
+| `--address` | `0x1000000` | Fyzická adresa na čítanie |
+| `--interval` | `500` | ms medzi frame-ami |
+| `--proc-interval` | `100` | Každých N frame-ov skenuj procesy/moduly/spojenia |
+| `--mock` | false | Mock mode bez KVM (testovanie) |
+| `--socket` | `/tmp/hyptcn.sock` | UDS socket pre Python analyzer |
 
-**Python analyzer flags** (`python/analyzer.py`):
+Príklady:
+```bash
+# Mock mode (bez VM, na testovanie)
+./bin/hyptcn --mock --interval 100
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--socket` | `/tmp/hyptcn.sock` | UDS listen path |
-| `--log-dir` | none | Save `.npy` frame files here (for offline training) |
-| `--label` | `unknown` | Subdirectory under `--log-dir` |
+# Reálna VM, raw mode (bez sysmap)
+./bin/hyptcn --vm hyptcn-guest --interval 500
 
----
-
-## Dataset Collection
-
-Use `--collect` mode (Go binary only, no Python required) to build the real training dataset. Each `.bin` file is exactly 4108 bytes: `[8B uint64 LE addr][4B uint32 LE label_id][4096B raw page]`.
-
-Label IDs: `normal=0`, `malware=1`, `shellcode=2`, `rootkit=3`, `cryptominer=4`, `ransomware=5`.
-
-```sh
-# One-time guest setup
-./collect_for_training/scripts/prepare_malware_env.sh hyptcn-guest
-
-# Guided wizard — all 5 labels with instructions per label
-./collect_for_training/scripts/collect_all_labels.sh hyptcn-guest 120 200
-
-# Or collect individual labels
-./collect_for_training/scripts/collect_normal.sh  hyptcn-guest 300 200
-./collect_for_training/scripts/collect_malware.sh hyptcn-guest shellcode 300 200
-
-# Check counts and estimated training sequences
-./collect_for_training/scripts/dataset_stats.sh
-
-# Train on collected frames
-./collect_for_training/scripts/quick_train.sh
-```
-
-Recommended minimums: `normal` ≥ 3000 frames, all other labels ≥ 1500 frames.
-At 200 ms interval: 3000 frames = 10 minutes of collection.
-
----
-
-## Project Structure
-
-```
-hypTCn/
-├── cmd/hyptcn/main.go              # CLI entry point (Cobra, all flags, grouped --help)
-├── internal/
-│   ├── extractor/
-│   │   ├── probe.h                 # C API: open/read/close/process/module/conn/v2p
-│   │   ├── probe.c                 # libvmi wrapper (raw PA + OS-layer with sysmap)
-│   │   └── extractor.go            # CGO bridge exposing Go types and methods
-│   └── orchestrator/
-│       └── engine.go               # Main loop: VMI read → analyze or collect → UDS
-├── python/
-│   ├── analyzer.py                 # asyncio UDS server, 16-frame window, inference
-│   └── model/
-│       ├── features.py             # 20-feature extractor (pure numpy, no torch)
-│       ├── tcn.py                  # TCNAnomalyDetector, dual-head, load/save/infer
-│       └── __init__.py             # Re-exports public API
-├── training/
-│   ├── synthetic.py                # Synthetic frame generator (5 archetypes)
-│   ├── dataset.py                  # MemoryPageDataset (.npy) + BinFrameDataset (.bin)
-│   ├── train.py                    # Multi-task training loop (BCE + CrossEntropy)
-│   └── evaluate.py                 # Accuracy/F1/ROC-AUC + latency benchmark
-├── collect_for_training/
-│   ├── {normal,shellcode,rootkit,  # Raw .bin frame files per label
-│   │    cryptominer,ransomware}/
-│   └── scripts/
-│       ├── prepare_malware_env.sh  # One-time guest setup (stress-ng, Diamorphine, sim)
-│       ├── collect_normal.sh       # Collect normal behavior frames
-│       ├── collect_malware.sh      # Collect one malware label with instructions
-│       ├── collect_all_labels.sh   # Interactive wizard: all 5 labels in sequence
-│       ├── dataset_stats.sh        # Print frame counts + sequence estimates per label
-│       └── quick_train.sh          # Wrapper: dataset_stats → train.py --data-source collect
-├── tools/
-│   └── get_sysmap.sh               # SSH into guest, copy /boot/System.map → configs/
-├── models/
-│   ├── tcn_weights.pt              # Trained weights (synthetic data, v2.0.0)
-│   ├── config.json                 # Hyperparameters + training stats
-│   └── README.md                   # Weight file format documentation
-├── configs/                        # System.map files (gitignored, placed by get_sysmap.sh)
-├── third_party/github.com/spf13/cobra/  # Minimal vendored Cobra (stdlib flag, no pflag)
-├── Makefile                        # build / deps / python-service / clean
-└── go.mod                          # Module: github.com/example/hypTcn
+# Plný OS-layer mode
+./bin/hyptcn --vm hyptcn-guest --sysmap configs/hyptcn-guest.sysmap --interval 500
 ```
 
 ---
 
-## Current Status
+## Wire Protocol
 
-| Works | Not Yet Done |
-|-------|-------------|
-| Live KVM introspection via libvmi legacy driver | Real malware dataset (all data is synthetic) |
-| Full pipeline: Go → UDS → Python → TCN → JSON | Live score has no ground truth — model needs real labels |
-| Mock mode (`--mock`) for pipeline testing without a VM | Smoke tests (`make test`) |
-| 20-feature extractor (page + temporal + OS-layer features) | Address sweep — scanner samples one fixed PA per run |
-| OS-layer: process list, kernel modules, TCP connections via `vmi_init_complete` | Semantic gap — no PA→VA→PID mapping without OS-layer active |
-| V2P translation (`TranslateV2P`) | `confusion_matrix.png` (add matplotlib to requirements) |
-| Dataset collection pipeline (`--collect`, 6 shell scripts) | Systemd unit files |
-| Multi-task TCN: anomaly score + activity class (5 classes) | Compare TCN vs LSTM/attention baseline |
-| Training on collected `.bin` frames (`--data-source collect`) | SIEM integration (syslog/Kafka/Elastic) |
-| `models/tcn_weights.pt` — synthetic accuracy 99.8%, ROC-AUC 1.0 | Multi-guest monitoring |
+**Go → Python** (4112 bytov/frame):
+```
+Offset  Veľkosť  Typ           Obsah
+0       8B       uint64 LE     fyzická adresa stránky
+8       4B       float32 LE    kernel_module_count_norm (moduly / 200)
+12      4B       float32 LE    network_conn_count_norm  (TCP spojenia / 100)
+16      4096B    raw bytes     surové dáta stránky
+```
+
+**Python → Go** (JSON + `\n`):
+```json
+{"anomaly_score": 0.0, "status": "warming_up"}
+{"anomaly_score": 0.02, "activity_class": "normal", "status": "ok"}
+{"anomaly_score": 0.91, "activity_class": "shellcode", "status": "ok"}
+```
+
+Status `warming_up` — prvých 15 frame-ov (sliding window sa plní).
+`alert: true` — score > 0.85.
 
 ---
 
-## License / Thesis
+## Model — TCN Architektúra
 
-This is a diploma thesis project. No license assigned yet.
+**Vstup:** tensor `(batch, 20, 16)` — 20 features × 16 frame-ov
+
+**Backbone:**
+- 3× `_TCNBlock` s diláciami [1, 2, 4]
+- Každý blok: 2× weight-normalized kauzálny Conv1d (kernel=3, filters=32, dropout=0.1) + residual
+- GlobalAvgPool1d → vektor 32
+
+**Výstupné hlavy:**
+- Anomaly: `Linear(32→16, ReLU) → Linear(16→1, Sigmoid)` → score ∈ [0,1]
+- Class:   `Linear(32→64, ReLU) → Linear(64→5)` → argmax → trieda 0–4
+
+**Triedy:** `0=normal, 1=shellcode, 2=rootkit, 3=cryptominer, 4=ransomware`
+
+**20 features:**
+
+| # | Feature | Popis |
+|---|---------|-------|
+| 0 | byte_entropy | Shannon entropia (0–8) |
+| 1 | nonzero_ratio | Podiel nenulových bajtov |
+| 2 | printable_ratio | Podiel ASCII printable znakov |
+| 3 | high_byte_ratio | Podiel bajtov > 0x7F |
+| 4 | unique_bytes | Počet unikátnych bajtov / 256 |
+| 5 | top4_freq | Frekvencia 4 najčastejších bajtov |
+| 6 | zero_runs | Pomér nulových sérií |
+| 7 | addr_norm | Normalizovaná fyzická adresa |
+| 8 | entropy_blocks_std | Std entropie naprieč 16 blokmi |
+| 9 | compression_ratio | Odhadovaný kompresný pomer |
+| 10 | null_run_ratio | Podiel nulových behov |
+| 11 | pe_header_score | Skóre PE hlavičky (Windows exec) |
+| 12 | elf_header_score | Skóre ELF hlavičky (Linux exec) |
+| 13 | syscall_pattern_count | Počet syscall vzorov / norm |
+| 14 | nop_sled_score | Detekcia NOP sled (0x90 sekvencie) |
+| 15 | string_density | Hustota ASCII stringov |
+| 16 | entropy_delta | Zmena entropie vs. predch. frame |
+| 17 | addr_delta | Zmena adresy vs. predch. frame |
+| 18 | kernel_module_count_norm | Počet kernel modulov / 200 |
+| 19 | network_conn_count_norm | Počet TCP spojení / 100 |
+
+---
+
+## VM — Technické detaily
+
+| Parameter | Hodnota |
+|-----------|---------|
+| Guest name | `hyptcn-guest` |
+| Disk | `~/vms/hyptcn-guest.qcow2` (overlay na `debian-12-base.qcow2`) |
+| Kernel | `6.1.0-42-cloud-amd64` (Debian 12 Bookworm) |
+| Root heslo | `hyptcn` |
+| IP | `192.168.122.100` (statická, `/etc/systemd/network/10-enp1s0.network`) |
+| Bridge | `virbr0` — `192.168.122.1/24` |
+| libvirt | `qemu:///session` (user session, nie system) |
+| System.map | `configs/hyptcn-guest.sysmap` — 3.5 MB reálny (z `/usr/lib/debug/boot/`) |
+
+> Libvirt `default` network je `inactive` — `virbr0` existuje cez NetworkManager ale DHCP nefunguje. VM má statickú IP a NAT treba obnoviť po reštarte hosta: `sudo bash tools/fix_nat.sh`
+
+---
+
+## Zber reálnych tréningových dát
+
+```bash
+# Počas normálnej aktivity
+./bin/hyptcn --vm hyptcn-guest --sysmap configs/hyptcn-guest.sysmap \
+    --interval 100 --log-dir collect_for_training/normal
+
+# Počas simulovaného útoku (iný terminál)
+./bin/hyptcn --vm hyptcn-guest --log-dir collect_for_training/shellcode
+
+# Po nazbieraní dát, pretrénuj
+./train.sh
+```
+
+Frames sa ukladajú ako `NNNNN_AAAAAAAAAAAAAAAA.bin` (frame index + hex adresa stránky).
+
+---
+
+## Zhrnutie príkazov
+
+```bash
+make deps                                    # Python venv + torch
+make                                         # Build Go binary
+./train.sh                                   # Generuj dáta + trénuj + nasaď váhy
+./run.sh                                     # Spusti monitoring pipeline
+sudo bash tools/fix_nat.sh                   # Obnov VM internet po reštarte hosta
+./tools/get_sysmap.sh hyptcn-guest           # Obnov System.map z VM
+ssh root@192.168.122.100                     # SSH do VM
+virsh --connect qemu:///session list --all   # Zoznam VM
+make clean                                   # Vyčisti build artefakty
+```
